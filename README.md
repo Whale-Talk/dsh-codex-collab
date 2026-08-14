@@ -12,6 +12,30 @@ DeepSeek Harness 网关 ── 编码子代理（多工作区、多 lane、fast/
 共享工作目录（任意目录，--cwd 指定）
 ```
 
+```mermaid
+flowchart LR
+    subgraph Codex["Codex (ChatGPT) — 项目经理 + 验收员"]
+        A1[dsh_task 派活]
+        A2[dsh_review 评审]
+        A3[dsh_read_file 验收]
+    end
+    subgraph DSH["DeepSeek Harness"]
+        B1[HTTP 网关 /api/dsh-bridge]
+        B2[编码子代理<br/>多工作区 · 多 lane · fast/pro]
+        B3[独立评审子代理<br/>必须跑通构建/测试]
+    end
+    subgraph FS["共享工作目录"]
+        C1[任意项目目录]
+    end
+    A1 --> B1
+    A2 --> B1
+    A3 --> C1
+    B1 --> B2 --> C1
+    B1 --> B3 --> C1
+    B2 -.实时回传汇报.-> B1
+    B1 -.任务结果.-> A1
+```
+
 ---
 
 ## 组件
