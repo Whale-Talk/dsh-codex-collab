@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./dsh-banner.png" width="100%">
+  <img src="./dsh-banner.png.png" width="100%">
 </p>
 
 # DSH Collab — Codex × DeepSeek Harness 双向编码协作
