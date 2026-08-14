@@ -1,0 +1,34 @@
+{
+  "name": "dsh",
+  "version": "0.1.0",
+  "description": "Codex 主导的双向编码协作插件：ChatGPT 把编码任务下发给本机 DeepSeek Harness 的持久编码子代理执行，DeepSeek 在共享工作目录 D:\\Harness 中写代码并实时回传进度与汇报，Codex 读文件验收、反馈修正，直到通过。",
+  "author": {
+    "name": "FuJackGao"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "collaboration",
+    "coding",
+    "pair-programming"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DeepSeek Harness 协作",
+    "shortDescription": "DeepSeek 写代码，Codex 验收",
+    "longDescription": "通过本机 DeepSeek Harness 的持久编码子代理执行编码任务：你下指令、DeepSeek 在共享目录 D:\\Harness 写代码并实时回传汇报、你在 Codex 中读文件验收并迭代修正，直到验收通过。",
+    "developerName": "FuJackGao",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "让 DeepSeek 帮我在共享目录里写一个待办事项应用，我负责验收",
+      "把这个 bug 交给 DeepSeek 修复，修完我来检查"
+    ],
+    "brandColor": "#4D6BFE",
+    "screenshots": []
+  }
+}
