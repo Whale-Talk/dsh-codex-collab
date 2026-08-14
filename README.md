@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./dsh-banner.png" width="100%">
+</p>
+
 # DSH Collab — Codex × DeepSeek Harness 双向编码协作
 
 **Codex 主导，DeepSeek 执行，Codex 验收。** 一个插件体系，让 ChatGPT（Codex）像项目经理一样把编码任务派给本机 DeepSeek Harness 的编码子代理，实时回传结果，读文件验收，并由独立评审员实际跑通构建/测试后出具评审报告。
