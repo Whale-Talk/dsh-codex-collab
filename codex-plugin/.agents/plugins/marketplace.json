@@ -1,0 +1,20 @@
+{
+  "name": "dsh-local",
+  "interface": {
+    "displayName": "DeepSeek Harness (Local)"
+  },
+  "plugins": [
+    {
+      "name": "dsh",
+      "source": {
+        "source": "local",
+        "path": "./plugins/dsh"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
