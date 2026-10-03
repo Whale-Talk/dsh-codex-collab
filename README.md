@@ -49,6 +49,7 @@ flowchart LR
 | `codex-plugin/` | Codex 本地市场插件包 | 标准 marketplace 结构（`.agents/plugins/marketplace.json` + 插件目录），含协作技能 `dsh-collab` |
 | `mcp/dsh-mcp.mjs` | MCP 服务器（零依赖 Node） | stdio 传输（Codex `[mcp_servers]` 直连）+ Streamable HTTP 传输（`--http`，供 Secure MCP Tunnel / cloudflared 桥接 ChatGPT）；5 个工具：`dsh_task` / `dsh_task_status` / `dsh_task_cancel` / `dsh_review` / `dsh_read_file` |
 | `harness/dsh-bridge.mjs` | DeepSeek Harness 宿主组合网关插件 | 提供 HTTP 网关（`/api/dsh-bridge/*`）、WS 推送、原生工具，管理编码/评审子代理会话。**必须装进 harness 宿主组合**（见下文） |
+| `cordis.patch.yml` | bundle patch | 把网关插件挂进 DSH 宿主组合；`dsh.bundle.patch` 指向它，所以 `dsh plugin add` 能自动 reconcile |
 
 ## 功能
 
@@ -62,6 +63,31 @@ flowchart LR
 - **结果回传**：任务汇报直接回 Codex 对话（`--wait` 默认）
 
 ## 安装
+
+### 0. 一条命令装全部（推荐，npm）
+
+```sh
+# 1) 网关插件装进 harness profile（自动 reconcile bundles，无需手工复制文件）
+dsh plugin --profile web add @whale-talk/dsh-codex-collab
+
+# 2) MCP 服务器交给 Codex
+npm install -g @whale-talk/dsh-codex-collab
+```
+
+之后 `dsh-mcp` / `dsh-task` / `dsh-review` 三个命令进入 PATH，`~/.codex/config.toml` 里写：
+
+```toml
+[mcp_servers.dsh]
+command = 'dsh-mcp'
+startup_timeout_sec = 120
+```
+
+装完**必须重启 profile 进程**——`dsh plugin add` 改的是 bundles 列表与 node_modules，HMR 不监控这两处。
+
+> 本包只提供 bundle patch，不含 profile 之外的强依赖：`@deepseek-ai/dsh-tools` 是 optional peer，由 DSH 安装树在运行时提供。因此 `npm install` 不会去 registry 拉它，也不会因它缺失而报错。
+
+<details>
+<summary>不想用 npm？仍可手工安装（源码方式）</summary>
 
 ### 1. DeepSeek Harness 网关（必需，后端）
 
@@ -78,6 +104,8 @@ flowchart LR
 ```
 GET http://127.0.0.1:3080/api/dsh-bridge/status
 ```
+
+> 手工方式必须用相对路径 `'./dsh-bridge.mjs'`，因为文件就在 profile 目录里；npm 方式则用包子路径 `@whale-talk/dsh-codex-collab/bridge`，两者不要混用。
 
 ### 2. Codex 侧（二选一或都用）
 
@@ -96,6 +124,12 @@ startup_timeout_sec = 120
 
 ```bash
 codex plugin add dsh@personal
+```
+
+npm 安装后，插件目录已在包内，用一行拿到绝对路径：
+
+```bash
+node -p "require.resolve('@whale-talk/dsh-codex-collab/package.json').replace(/package\.json$/,'codex-plugin')"
 ```
 
 > ⚠️ 已知问题：Codex Desktop 26.803 在 Windows 上存在插件技能不注入会话的 bug（[openai/codex#26037](https://github.com/openai/codex/issues/26037)、[#22078](https://github.com/openai/codex/issues/22078)）。技能形式可能不生效，**以 MCP 方式为准**。
@@ -117,18 +151,20 @@ tunnel-client run --profile dsh
 
 > 注意：写入型 MCP 工具对 ChatGPT 个人订阅（Plus）的开放度存在产品级限制，此路径仅供有能力/有组织的账户使用。
 
+</details>
+
 ## 使用
 
 **Codex 工作区会话**（MCP 工具就绪后）：
 
 > 用 dsh_task 让 DeepSeek 生成一个随机密码 CLI + 测试 + README，放在当前项目目录，完成后你用 dsh_read_file 验收，再 dsh_review 评审
 
-**命令行**（等价脚本，位于插件 `skills/dsh-collab/scripts/`）：
+**命令行**（npm 安装后直接用；源码方式用 `node <脚本路径>`）：
 
 ```bash
-node task.mjs --in "<指令>" --cwd "<目录>" [--lane backend] [--model fast|pro] [--commit]
-node review.mjs --cwd "<目录>" [--diff git|@文件|"diff文本"] [--focus "<重点>"]
-node task.mjs --list | --status <taskId> | --cancel <taskId>
+dsh-task --in "<指令>" --cwd "<目录>" [--lane backend] [--model fast|pro] [--commit]
+dsh-review --cwd "<目录>" [--diff git|@文件|"diff文本"] [--focus "<重点>"]
+dsh-task --list | --status <taskId> | --cancel <taskId>
 ```
 
 ## 环境变量
@@ -142,6 +178,7 @@ node task.mjs --list | --status <taskId> | --cancel <taskId>
 
 ## 已知限制
 
+- 网关插件需要 `webServer` 服务（由 `dsh-web-app` 提供），因此**只能挂 web / desktop profile**；headless profile 会一直 pending
 - Codex Desktop Windows 本地市场技能注入 bug（见上，MCP 通道不受影响）
 - 动态插件环境无 `AbortSignal`，冷恢复失败时自动降级为一次性执行；宿主组合持久化版无此问题
 - ChatGPT Plus 写入型 MCP 的开放度取决于 OpenAI 产品策略

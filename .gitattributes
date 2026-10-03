@@ -1,0 +1,11 @@
+# Keep every shipped file LF. The ESM entrypoints start with a shebang, and a
+# trailing CR there (`#!/usr/bin/env node\r`) breaks direct execution on Linux —
+# which is exactly where the publish workflow and every consumer's DSH host run.
+* text=auto eol=lf
+
+*.mjs text eol=lf
+*.js  text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.md  text eol=lf
+*.png binary

@@ -1,0 +1,20 @@
+# DSH Collab bundle layer — 双向编码协作网关。
+#
+# 安装（npm）：
+#   dsh plugin --profile web add @whale-talk/dsh-codex-collab
+# `dsh plugin add` 会把本包加入 profile 的 dsh.profile.bundles，并自动套用本
+# patch，无需手工复制 dsh-bridge.mjs。
+#
+# 下面这一行把宿主网关插件插进 bundle：
+#   - id  dsh-bridge       —— 行 id。用户的 patch 层可用同 id 覆盖整段 config。
+#   - name用包子路径而非相对路径（对比 './dsh-bridge.mjs'）：只有这样从 npm 安装
+#     后解析器才能定位到包内文件，同时保持 profile 目录干净。
+#
+# 依赖的服务：webServer / agents / subagents / tools 四个注入，加上运行时取用的
+# timer、sessionQuery、agentPresets、sessionPersistence、workspaceRegistry、llm。
+# 其中 webServer 由 dsh-web-app 提供 —— 因此本 bundle 只能挂 web / desktop
+# profile，headless profile 没有该服务会一直 pending。
+# 本插件不使用 workflowEngine，所以 web GUI 默认禁用 workflow 引擎不影响它。
+- insert:
+    - id: dsh-bridge
+      name: '@whale-talk/dsh-codex-collab/bridge'

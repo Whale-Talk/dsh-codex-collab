@@ -1,0 +1,199 @@
+name: Publish to npm
+
+on:
+  # 打 tag 即发布：v0.1.0 -> 0.1.0
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  # 也支持手动触发重发 / 预演
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只做 pack 校验，不真正发布'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # provenance 签名需要
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Syntax-check every shipped module
+        run: |
+          set -euo pipefail
+          for f in harness/*.mjs mcp/*.mjs \
+                   codex-plugin/plugins/dsh/skills/dsh-collab/scripts/*.mjs; do
+            node --check "$f"
+            echo "ok  $f"
+          done
+
+      - name: Package contract
+        run: |
+          set -euo pipefail
+          node -e '
+            const p = require("./package.json");
+            const need = [
+              "package.json", "cordis.patch.yml", "README.md", "LICENSE",
+              "harness/dsh-bridge.mjs", "mcp/dsh-mcp.mjs",
+              "codex-plugin/plugins/dsh/skills/dsh-collab/SKILL.md",
+            ];
+            if (p.name !== "@whale-talk/dsh-codex-collab") throw new Error("unexpected name: " + p.name);
+            if (p.publishConfig?.access !== "public") throw new Error("publishConfig.access must be public");
+            if (!p.dsh?.bundle?.patch) throw new Error("missing dsh.bundle.patch");
+            for (const b of Object.keys(p.bin || {})) {
+              if (!p.bin[b].startsWith("./")) throw new Error("bin path must be relative: " + b);
+            }
+            console.log("contract ok:", p.name, p.version);
+          '
+
+      - name: Pack and assert tarball contents
+        run: |
+          set -euo pipefail
+          npm pack --json > pack.json
+          node -e '
+            const meta = require("./pack.json")[0];
+            const paths = new Set(meta.files.map(f => f.path.replace(/^package\//, "")));
+            const need = [
+              "package.json", "cordis.patch.yml", "README.md", "LICENSE",
+              "harness/dsh-bridge.mjs", "mcp/dsh-mcp.mjs",
+              "codex-plugin/plugins/dsh/skills/dsh-collab/SKILL.md",
+              "codex-plugin/plugins/dsh/.codex-plugin/plugin.json",
+            ];
+            const missing = need.filter(n => !paths.has(n));
+            if (missing.length) throw new Error("tarball missing: " + missing.join(", "));
+            if (paths.has("dsh-banner.png.png") === false) throw new Error("README banner missing from tarball");
+            console.log("tarball ok:", meta.filename, meta.entryCount + " entries",
+                        (meta.unpackedSize / 1024).toFixed(0) + " KiB unpacked");
+          '
+
+      - name: Install the tarball and smoke-test the CLIs
+        run: |
+          set -euo pipefail
+          TGZ=$(node -p 'require("./pack.json")[0].filename')
+          rm -rf "$RUNNER_TEMP/smoke"
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke"
+          npm init -y > /dev/null
+          npm install "$GITHUB_WORKSPACE/$TGZ"
+          echo "--- installed bin links ---"
+          ls -l node_modules/.bin/
+          for b in dsh-mcp dsh-task dsh-review; do
+            [ -e "node_modules/.bin/$b" ] || { echo "::error::missing bin shim: $b"; exit 1; }
+          done
+          PKG=node_modules/@whale-talk/dsh-codex-collab
+          echo "--- dsh-mcp: initialize handshake over stdio ---"
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | node "$PKG/mcp/dsh-mcp.mjs" 2>/dev/null \
+            | tee handshake.jsonl \
+            | node -e '
+              let buf = "";
+              process.stdin.on("data", d => buf += d).on("end", () => {
+                const lines = buf.trim().split("\n").filter(Boolean).map(JSON.parse);
+                const init = lines.find(l => l.id === 1);
+                const list = lines.find(l => l.id === 2);
+                if (!init?.result?.serverInfo) throw new Error("initialize failed: " + buf);
+                const names = (list?.result?.tools || []).map(t => t.name).sort();
+                const want = ["dsh_read_file","dsh_review","dsh_task","dsh_task_cancel","dsh_task_status"];
+                if (JSON.stringify(names) !== JSON.stringify(want)) {
+                  throw new Error("tool set mismatch: " + JSON.stringify(names));
+                }
+                console.log("mcp ok:", init.result.serverInfo.name, init.result.serverInfo.version, names.join(","));
+              });
+            '
+          echo "--- dsh-task: --list must not crash when no gateway is up ---"
+          node "$PKG/codex-plugin/plugins/dsh/skills/dsh-collab/scripts/task.mjs" --list || true
+          echo "--- dsh-review: --help style usage output ---"
+          node "$PKG/codex-plugin/plugins/dsh/skills/dsh-collab/scripts/review.mjs" --cwd "$(pwd)" || true
+
+      - name: Bridge plugin exports the Cordis contract
+        # `@deepseek-ai/dsh-tools` is an OPTIONAL peer supplied by the DSH profile
+        # at runtime, never by npm — so importing the bridge straight out of
+        # node_modules would fail here for a reason that does not affect real
+        # installs. Stub the peer to assert the module's own export shape.
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/smoke"
+          mkdir -p node_modules/@deepseek-ai/dsh-tools
+          cat > node_modules/@deepseek-ai/dsh-tools/package.json <<'JSON'
+          { "name": "@deepseek-ai/dsh-tools", "version": "0.0.0-stub", "type": "module",
+            "main": "./index.mjs" }
+          JSON
+          cat > node_modules/@deepseek-ai/dsh-tools/index.mjs <<'JS'
+          export const defineTool = (spec) => spec
+          JS
+          node --input-type=module -e '
+            import { pathToFileURL } from "node:url";
+            const url = pathToFileURL(process.cwd() + "/node_modules/@whale-talk/dsh-codex-collab/harness/dsh-bridge.mjs").href;
+            const mod = await import(url);
+            if (mod.name !== "dsh-bridge") throw new Error("bad plugin name: " + mod.name);
+            if (typeof mod.apply !== "function") throw new Error("apply() missing");
+            const need = ["webServer", "agents", "subagents", "tools"];
+            for (const k of need) {
+              if (!mod.inject.includes(k)) throw new Error("inject missing " + k);
+            }
+            console.log("bridge ok:", mod.name, "inject=[" + mod.inject.join(",") + "]");
+          '
+
+      - name: Bundle patch points at the packaged subpath
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const p = require("./package.json");
+            const patch = fs.readFileSync(p.dsh.bundle.patch, "utf8");
+            const sub = "@whale-talk/dsh-codex-collab/bridge";
+            if (!p.exports["./bridge"]) throw new Error("exports must expose ./bridge");
+            // Inspect resolved rows only — prose in comments may quote the old
+            // profile-relative form, so a naive substring check false-positives.
+            const rows = patch.split("\n").filter(l => /^\s*name:/.test(l));
+            if (!rows.length) throw new Error("patch declares no plugin rows");
+            for (const row of rows) {
+              if (!row.includes(sub)) throw new Error("row not on the packaged subpath: " + row.trim());
+            }
+            if (!patch.includes("- id: dsh-bridge")) throw new Error("row id must be dsh-bridge");
+            console.log("patch ok:", rows.length, "row(s) on", sub);
+          '
+
+  publish:
+    name: Publish
+    needs: verify
+    if: github.event_name == 'push' || !inputs.dry_run
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Assert tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(node -p 'require("./package.json").version')
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::tag $TAG != package version $VER"
+            exit 1
+          fi
+          echo "tag/version aligned: $VER"
+
+      - name: Publish to npm with provenance
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

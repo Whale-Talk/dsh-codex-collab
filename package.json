@@ -1,0 +1,68 @@
+{
+  "name": "@whale-talk/dsh-codex-collab",
+  "version": "0.1.0",
+  "description": "Codex × DeepSeek Harness 双向编码协作：Codex 主导派活与验收，DeepSeek Harness 编码子代理在共享工作目录执行并回传，独立评审子代理实际跑通构建/测试后出具报告。提供 DSH 宿主网关插件、零依赖 MCP 服务器与 Codex 技能三件套。",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "bin": {
+    "dsh-mcp": "./mcp/dsh-mcp.mjs",
+    "dsh-task": "./codex-plugin/plugins/dsh/skills/dsh-collab/scripts/task.mjs",
+    "dsh-review": "./codex-plugin/plugins/dsh/skills/dsh-collab/scripts/review.mjs"
+  },
+  "main": "./harness/dsh-bridge.mjs",
+  "exports": {
+    ".": "./harness/dsh-bridge.mjs",
+    "./bridge": "./harness/dsh-bridge.mjs",
+    "./mcp": "./mcp/dsh-mcp.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "harness/",
+    "mcp/",
+    "codex-plugin/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "dsh-banner.png.png"
+  ],
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "codex",
+    "mcp",
+    "collaboration",
+    "coding-agent",
+    "code-review",
+    "pair-programming"
+  ],
+  "author": "FuJackGao",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Whale-Talk/dsh-codex-collab.git"
+  },
+  "homepage": "https://github.com/Whale-Talk/dsh-codex-collab#readme",
+  "bugs": {
+    "url": "https://github.com/Whale-Talk/dsh-codex-collab/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
+}
