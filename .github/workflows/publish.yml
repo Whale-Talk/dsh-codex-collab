@@ -59,7 +59,8 @@ jobs:
       - name: Unit-test the session-target decision layer
         # 纯函数，不需要 DSH 运行时：目标判定、候选挑选（0/1/N）、错误映射、
         # 基线切分、响应回显。这些是"接进已有会话"最容易出错的地方。
-        run: node --test test/
+        # 用显式 glob：`node --test test/` 在 Node 22 上会把目录当成模块路径。
+        run: node --test test/*.test.mjs
 
       - name: Package contract
         run: |
