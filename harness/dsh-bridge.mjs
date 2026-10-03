@@ -235,12 +235,18 @@ export async function apply(ctx) {
 
   const createOwner = async (bucket) => {
     const modelOptions = pickModelOptions()
+    let ownerPreset = 'code'
+    if (agentPresets !== undefined) {
+      const presets = await agentPresets.list()
+      const available = (id) => presets.some((p) => p.id === id && !p.broken)
+      if (!available('code') && available('standard')) ownerPreset = 'standard'
+    }
     const handle = await agents.create({
       sessionId: 'dsh-bridge-owner-' + uid(),
-      meta: { cwd: bucket.cwd, origin: 'subagent', agentPreset: 'code' },
+      meta: { cwd: bucket.cwd, origin: 'subagent', agentPreset: ownerPreset },
       agentOptions: modelOptions,
       setup: async (agentCtx) => {
-        if (agentPresets !== undefined) await agentPresets.mount(agentCtx, 'code')
+        if (agentPresets !== undefined) await agentPresets.mount(agentCtx, ownerPreset)
       },
     })
     bucket.handle = handle
