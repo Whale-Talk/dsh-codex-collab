@@ -74,6 +74,8 @@ dsh plugin --profile web add @whaletalk/dsh-codex-collab
 npm install -g @whaletalk/dsh-codex-collab
 ```
 
+> 在 DSH 客户端「插件 → 添加插件」里也可以直接填**无 scope 别名** `dsh-codex-collab`（与真身等价的一次性转发包，二者装其一即可，不要同时装）。
+
 之后 `dsh-mcp` / `dsh-task` / `dsh-review` 三个命令进入 PATH，`~/.codex/config.toml` 里写：
 
 ```toml
