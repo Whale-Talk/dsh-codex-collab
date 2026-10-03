@@ -68,10 +68,10 @@ flowchart LR
 
 ```sh
 # 1) 网关插件装进 harness profile（自动 reconcile bundles，无需手工复制文件）
-dsh plugin --profile web add @whale-talk/dsh-codex-collab
+dsh plugin --profile web add @whaletalk/dsh-codex-collab
 
 # 2) MCP 服务器交给 Codex
-npm install -g @whale-talk/dsh-codex-collab
+npm install -g @whaletalk/dsh-codex-collab
 ```
 
 之后 `dsh-mcp` / `dsh-task` / `dsh-review` 三个命令进入 PATH，`~/.codex/config.toml` 里写：
@@ -105,7 +105,7 @@ startup_timeout_sec = 120
 GET http://127.0.0.1:3080/api/dsh-bridge/status
 ```
 
-> 手工方式必须用相对路径 `'./dsh-bridge.mjs'`，因为文件就在 profile 目录里；npm 方式则用包子路径 `@whale-talk/dsh-codex-collab/bridge`，两者不要混用。
+> 手工方式必须用相对路径 `'./dsh-bridge.mjs'`，因为文件就在 profile 目录里；npm 方式则用包子路径 `@whaletalk/dsh-codex-collab/bridge`，两者不要混用。
 
 ### 2. Codex 侧（二选一或都用）
 
@@ -129,7 +129,7 @@ codex plugin add dsh@personal
 npm 安装后，插件目录已在包内，用一行拿到绝对路径：
 
 ```bash
-node -p "require.resolve('@whale-talk/dsh-codex-collab/package.json').replace(/package\.json$/,'codex-plugin')"
+node -p "require.resolve('@whaletalk/dsh-codex-collab/package.json').replace(/package\.json$/,'codex-plugin')"
 ```
 
 > ⚠️ 已知问题：Codex Desktop 26.803 在 Windows 上存在插件技能不注入会话的 bug（[openai/codex#26037](https://github.com/openai/codex/issues/26037)、[#22078](https://github.com/openai/codex/issues/22078)）。技能形式可能不生效，**以 MCP 方式为准**。

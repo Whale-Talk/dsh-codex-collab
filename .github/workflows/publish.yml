@@ -49,7 +49,7 @@ jobs:
               "harness/dsh-bridge.mjs", "mcp/dsh-mcp.mjs",
               "codex-plugin/plugins/dsh/skills/dsh-collab/SKILL.md",
             ];
-            if (p.name !== "@whale-talk/dsh-codex-collab") throw new Error("unexpected name: " + p.name);
+            if (p.name !== "@whaletalk/dsh-codex-collab") throw new Error("unexpected name: " + p.name);
             if (p.publishConfig?.access !== "public") throw new Error("publishConfig.access must be public");
             if (!p.dsh?.bundle?.patch) throw new Error("missing dsh.bundle.patch");
             for (const b of Object.keys(p.bin || {})) {
@@ -92,7 +92,7 @@ jobs:
           for b in dsh-mcp dsh-task dsh-review; do
             [ -e "node_modules/.bin/$b" ] || { echo "::error::missing bin shim: $b"; exit 1; }
           done
-          PKG=node_modules/@whale-talk/dsh-codex-collab
+          PKG=node_modules/@whaletalk/dsh-codex-collab
           echo "--- dsh-mcp: initialize handshake over stdio ---"
           printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
@@ -137,7 +137,7 @@ jobs:
           JS
           node --input-type=module -e '
             import { pathToFileURL } from "node:url";
-            const url = pathToFileURL(process.cwd() + "/node_modules/@whale-talk/dsh-codex-collab/harness/dsh-bridge.mjs").href;
+            const url = pathToFileURL(process.cwd() + "/node_modules/@whaletalk/dsh-codex-collab/harness/dsh-bridge.mjs").href;
             const mod = await import(url);
             if (mod.name !== "dsh-bridge") throw new Error("bad plugin name: " + mod.name);
             if (typeof mod.apply !== "function") throw new Error("apply() missing");
@@ -155,7 +155,7 @@ jobs:
             const fs = require("fs");
             const p = require("./package.json");
             const patch = fs.readFileSync(p.dsh.bundle.patch, "utf8");
-            const sub = "@whale-talk/dsh-codex-collab/bridge";
+            const sub = "@whaletalk/dsh-codex-collab/bridge";
             if (!p.exports["./bridge"]) throw new Error("exports must expose ./bridge");
             // Inspect resolved rows only — prose in comments may quote the old
             // profile-relative form, so a naive substring check false-positives.

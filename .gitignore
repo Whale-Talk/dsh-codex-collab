@@ -1,0 +1,14 @@
+# npm pack output
+*.tgz
+pack.json
+
+# scratch files produced while driving the release workflow locally
+step*.log
+ss.txt
+o*.txt
+p*.txt
+.sid
+.orgname
+
+# dependencies
+node_modules/

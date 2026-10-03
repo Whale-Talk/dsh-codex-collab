@@ -1,7 +1,7 @@
 # DSH Collab bundle layer — 双向编码协作网关。
 #
 # 安装（npm）：
-#   dsh plugin --profile web add @whale-talk/dsh-codex-collab
+#   dsh plugin --profile web add @whaletalk/dsh-codex-collab
 # `dsh plugin add` 会把本包加入 profile 的 dsh.profile.bundles，并自动套用本
 # patch，无需手工复制 dsh-bridge.mjs。
 #
@@ -17,4 +17,4 @@
 # 本插件不使用 workflowEngine，所以 web GUI 默认禁用 workflow 引擎不影响它。
 - insert:
     - id: dsh-bridge
-      name: '@whale-talk/dsh-codex-collab/bridge'
+      name: '@whaletalk/dsh-codex-collab/bridge'
