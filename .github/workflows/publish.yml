@@ -11,6 +11,10 @@ on:
         description: '只做 pack 校验，不真正发布'
         type: boolean
         default: true
+      check_auth:
+        description: '只读检查 NPM_TOKEN 是否有效，不上传包'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,6 +33,19 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Check npm authentication (read only)
+        if: github.event_name == 'push' || inputs.check_auth
+        run: |
+          set -euo pipefail
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN is not configured"
+            exit 1
+          fi
+          npm whoami --registry=https://registry.npmjs.org
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Syntax-check every shipped module
         run: |
