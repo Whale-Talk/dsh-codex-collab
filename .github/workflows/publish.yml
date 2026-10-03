@@ -56,6 +56,11 @@ jobs:
             echo "ok  $f"
           done
 
+      - name: Unit-test the session-target decision layer
+        # 纯函数，不需要 DSH 运行时：目标判定、候选挑选（0/1/N）、错误映射、
+        # 基线切分、响应回显。这些是"接进已有会话"最容易出错的地方。
+        run: node --test test/
+
       - name: Package contract
         run: |
           set -euo pipefail
@@ -63,7 +68,7 @@ jobs:
             const p = require("./package.json");
             const need = [
               "package.json", "cordis.patch.yml", "README.md", "LICENSE",
-              "harness/dsh-bridge.mjs", "mcp/dsh-mcp.mjs",
+              "harness/dsh-bridge.mjs", "harness/session-target.mjs", "mcp/dsh-mcp.mjs",
               "codex-plugin/plugins/dsh/skills/dsh-collab/SKILL.md",
             ];
             if (p.name !== "@whaletalk/dsh-codex-collab") throw new Error("unexpected name: " + p.name);
@@ -106,7 +111,7 @@ jobs:
             const paths = new Set(meta.files.map(f => f.path.replace(/^package\//, "")));
             const need = [
               "package.json", "cordis.patch.yml", "README.md", "LICENSE",
-              "harness/dsh-bridge.mjs", "mcp/dsh-mcp.mjs",
+              "harness/dsh-bridge.mjs", "harness/session-target.mjs", "mcp/dsh-mcp.mjs",
               "codex-plugin/plugins/dsh/skills/dsh-collab/SKILL.md",
               "codex-plugin/plugins/dsh/.codex-plugin/plugin.json",
             ];
@@ -146,7 +151,7 @@ jobs:
                 const list = lines.find(l => l.id === 2);
                 if (!init?.result?.serverInfo) throw new Error("initialize failed: " + buf);
                 const names = (list?.result?.tools || []).map(t => t.name).sort();
-                const want = ["dsh_read_file","dsh_review","dsh_task","dsh_task_cancel","dsh_task_status"];
+                const want = ["dsh_read_file","dsh_review","dsh_sessions","dsh_task","dsh_task_cancel","dsh_task_status"];
                 if (JSON.stringify(names) !== JSON.stringify(want)) {
                   throw new Error("tool set mismatch: " + JSON.stringify(names));
                 }

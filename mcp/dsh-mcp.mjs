@@ -6,7 +6,7 @@
 //      客户端（Secure MCP Tunnel / cloudflared）桥接给 ChatGPT 等远程产品。
 const GATEWAY = process.env.DSH_BRIDGE_URL || 'http://127.0.0.1:3080'
 const SERVER_NAME = 'dsh-bridge'
-const SERVER_VERSION = '0.1.1'
+const SERVER_VERSION = '0.1.2'
 const PROTOCOL_VERSION = '2024-11-05'
 
 const log = (...args) => console.error('[dsh-mcp]', ...args)
@@ -15,21 +15,41 @@ const tools = [
   {
     name: 'dsh_task',
     description:
-      '把编码任务交给本机 DeepSeek Harness 的编码子代理执行（DeepSeek 写代码，ChatGPT/Codex 验收）。' +
+      '把编码任务交给本机 DeepSeek Harness 执行（DeepSeek 写代码，ChatGPT/Codex 验收）。两种目标：默认新建编码子代理在 cwd 里干活；' +
+      '给出 sessionId 或 sessionQuery 时改为**投递进那一条已有会话**（保留它自己的上下文，不新建会话/工作区）。' +
       '参数: instruction(必填,完整中文指令:目标/产出目录/验收标准/约束), cwd(工作目录,默认 D:\\Harness,通常传当前项目目录), ' +
       'lane(并行通道名,默认 main), model(fast=deepseek-v4-flash 快而省 / pro=deepseek-v4-pro 质量优先), ' +
+      'sessionId(已有会话 id), sessionQuery(按标题/内容搜已有会话,需唯一命中,否则返回候选), deliver(queue=排队(默认) / steer=插入当前回合), ' +
       'wait(默认 true,阻塞至任务完成并返回 DeepSeek 汇报), timeoutSec(默认 600,最长 900)。',
     inputSchema: {
       type: 'object',
       properties: {
         instruction: { type: 'string', description: '完整中文编码指令（目标、产出目录、验收标准、约束）。' },
-        cwd: { type: 'string', description: '工作目录（绝对路径）。默认 D:\\Harness。' },
+        cwd: { type: 'string', description: '工作目录（绝对路径）。默认 D:\\Harness。与 sessionId/sessionQuery 互斥。' },
         lane: { type: 'string', description: '并行通道名（默认 main）。' },
         model: { type: 'string', enum: ['fast', 'pro'], description: '模型别名：fast=deepseek-v4-flash，pro=deepseek-v4-pro。' },
+        sessionId: { type: 'string', description: '已有会话 id：把指令投递进这条会话，而不是新建子代理。' },
+        sessionQuery: { type: 'string', description: '按标题或内容搜索已有会话；唯一命中才派发，多条会返回 candidates 让你改用 sessionId。' },
+        deliver: { type: 'string', enum: ['queue', 'steer'], description: '投递方式：queue 排队（默认），steer 插入当前回合。' },
         wait: { type: 'boolean', description: '默认 true：阻塞直到任务完成并返回汇报。' },
         timeoutSec: { type: 'number', description: '最长等待秒数（默认 600，最大 900）。' },
       },
       required: ['instruction'],
+    },
+  },
+  {
+    name: 'dsh_sessions',
+    description:
+      '只读查找本机 DSH 的已有会话（不创建、不投递）。用 sessionQuery 按标题/内容搜，或用 sessionId 直接解析某一条；' +
+      '拿到 sessionId 后交给 dsh_task 即可把任务投递进那条会话。参数: query, sessionId, limit(默认 10), inspect(默认 false,为 true 时探测前 5 条能否接)。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '按标题/内容搜索（与 sessionId 二选一）。' },
+        sessionId: { type: 'string', description: '直接解析某条会话（与 query 二选一）。' },
+        limit: { type: 'number', description: '最多返回条数（默认 10，最大 50）。' },
+        inspect: { type: 'boolean', description: '为 true 时对前 5 条探测 agentAvailable / problem（默认 false）。' },
+      },
     },
   },
   {
@@ -43,10 +63,13 @@ const tools = [
   },
   {
     name: 'dsh_task_cancel',
-    description: '取消一个运行中的 DeepSeek 协作任务。参数: taskId(必填)。',
+    description: '取消一个运行中的 DeepSeek 协作任务。参数: taskId(必填), force(session 目标的任务默认拒绝取消,因为它会打断用户自己的回合;确认要打断时传 true)。',
     inputSchema: {
       type: 'object',
-      properties: { taskId: { type: 'string', description: '任务 ID。' } },
+      properties: {
+        taskId: { type: 'string', description: '任务 ID。' },
+        force: { type: 'boolean', description: '仅对投递进已有会话的任务有意义：true 才真正打断该会话。' },
+      },
       required: ['taskId'],
     },
   },
@@ -112,18 +135,36 @@ async function handleToolCall(name, args) {
       cwd: args.cwd,
       lane: args.lane,
       model: args.model,
+      sessionId: args.sessionId,
+      sessionQuery: args.sessionQuery,
+      deliver: args.deliver,
     })
+    // 4xx 拒绝（缺目标 / 会话不存在 / 搜索结果不唯一 / 被写锁占用）不带 taskId，绝不静默新建。
+    if (task.taskId === undefined) return { ok: false, phase: 'rejected', ...task }
     if (task.status === 'error') return { ok: false, ...task }
     if (args.wait === false) return { ok: true, phase: 'submitted', ...task }
     const done = await waitTask(task.taskId, args.timeoutSec || 600)
     return { ok: done.status === 'done', phase: 'finished', ...done }
+  }
+  if (name === 'dsh_sessions') {
+    if (args.query === undefined && args.sessionId === undefined) {
+      return { ok: false, error: 'query or sessionId is required' }
+    }
+    const found = await callGateway('/api/dsh-bridge/sessions', {
+      query: args.query,
+      sessionId: args.sessionId,
+      limit: args.limit,
+      inspect: args.inspect,
+    })
+    if (Array.isArray(found.items)) return { ok: true, ...found }
+    return { ok: false, ...found }
   }
   if (name === 'dsh_task_status') {
     const res = await fetch(GATEWAY + '/api/dsh-bridge/status?taskId=' + encodeURIComponent(args.taskId))
     return res.json()
   }
   if (name === 'dsh_task_cancel') {
-    return callGateway('/api/dsh-bridge/cancel', { taskId: args.taskId })
+    return callGateway('/api/dsh-bridge/cancel', { taskId: args.taskId, force: args.force === true })
   }
   if (name === 'dsh_review') {
     const task = await callGateway('/api/dsh-bridge/review', { cwd: args.cwd, diff: args.diff, focus: args.focus })

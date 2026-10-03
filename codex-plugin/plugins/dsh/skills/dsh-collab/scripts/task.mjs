@@ -22,7 +22,7 @@ const HISTORY_CANDIDATES = process.env.DSH_BRIDGE_HISTORY
 const HISTORY_MAX = 40
 
 function parseArgs(argv) {
-  const out = { wait: true, timeoutSec: 600, instruction: '', cwd: '', lane: '', model: '', commit: false, list: false, cancel: '', status: '' }
+  const out = { wait: true, timeoutSec: 600, instruction: '', cwd: '', lane: '', model: '', commit: false, list: false, cancel: '', status: '', sessions: '', sessionId: '', find: '', steer: false, force: false }
   const rest = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -37,6 +37,11 @@ function parseArgs(argv) {
     else if (a === '--list') { out.list = true }
     else if (a === '--cancel') { out.cancel = argv[++i] || '' }
     else if (a === '--status') { out.status = argv[++i] || '' }
+    else if (a === '--sessions') { out.sessions = argv[++i] || '' }
+    else if (a === '--session') { out.sessionId = argv[++i] || '' }
+    else if (a === '--find') { out.find = argv[++i] || '' }
+    else if (a === '--steer') { out.steer = true }
+    else if (a === '--force') { out.force = true }
     else { rest.push(a) }
   }
   if (!out.instruction && rest.length > 0) out.instruction = rest.join(' ')
@@ -152,39 +157,84 @@ async function main() {
     finish(0)
   }
   if (opts.cancel) {
-    const res = await request('POST', GATEWAY + '/api/dsh-bridge/cancel', { taskId: opts.cancel })
+    const res = await request('POST', GATEWAY + '/api/dsh-bridge/cancel', { taskId: opts.cancel, force: opts.force === true })
     console.log(JSON.stringify(res.json, null, 2))
-    finish(0)
+    finish(res.status === 409 ? 5 : 0)
   }
   if (opts.status) {
     const res = await request('GET', GATEWAY + '/api/dsh-bridge/status?taskId=' + encodeURIComponent(opts.status))
     console.log(JSON.stringify(res.json, null, 2))
     finish(0)
   }
+  if (opts.sessions) {
+    const res = await request('POST', GATEWAY + '/api/dsh-bridge/sessions', { query: opts.sessions, inspect: true, limit: 20 })
+    if (res.json === null || typeof res.json !== 'object') {
+      console.error('task.mjs: 网关返回 ' + res.status + '，响应不是 JSON —— profile 里的插件可能还是旧版本（session 接口需要 0.1.2+）')
+      console.error(String(res.text || '').slice(0, 200))
+      finish(1)
+    }
+    console.log(JSON.stringify(res.json, null, 2))
+    const items = Array.isArray(res.json.items) ? res.json.items : []
+    finish(items.length > 0 ? 0 : 4)
+  }
 
   const instruction = opts.instruction.trim()
   if (!instruction) {
     console.error('用法: node task.mjs --in "<指令>" [--cwd 目录] [--lane 名] [--model fast|pro] [--commit] [--timeout 秒] [--no-wait]')
-    console.error('管理: node task.mjs --list | --status <taskId> | --cancel <taskId>')
+    console.error('      node task.mjs --in "<指令>" (--session <会话id> | --find "<标题关键词>") [--steer]   # 投递进已有会话')
+    console.error('查找: node task.mjs --sessions "<标题关键词>"   # 只读列出候选, 拿 sessionId 再派活')
+    console.error('管理: node task.mjs --list | --status <taskId> | --cancel <taskId> [--force]')
+    console.error('退出码: 0 成功 / 1 失败 / 2 用法 / 3 超时 / 4 会话未命中或不唯一 / 5 session 目标取消被拒')
     finish(2)
   }
   const cwd = (opts.cwd || process.env.DSH_BRIDGE_CWD || '').trim()
-  if (cwd) {
+  const sessionId = (opts.sessionId || '').trim()
+  const find = (opts.find || '').trim()
+  const sessionTarget = sessionId !== '' ? { sessionId } : (find !== '' ? { sessionQuery: find } : null)
+  if (sessionTarget !== null && (cwd !== '' || opts.commit)) {
+    console.error('task.mjs: --session/--find 不能与 --cwd/--commit 同时使用（已有会话自带工作目录，本工具不替它提交）')
+    finish(2)
+  }
+  if (sessionTarget === null && cwd) {
     try { fs.mkdirSync(cwd, { recursive: true }) } catch (e) {
       console.error('task.mjs: 无法创建目录 ' + cwd + ':', e.message)
       finish(2)
     }
   }
-  const history = readHistory()
+  const history = sessionTarget === null ? readHistory() : []
   const posted = await request('POST', GATEWAY + '/api/dsh-bridge/task', {
-    instruction, history,
-    ...(cwd ? { cwd } : {}),
-    ...(opts.lane ? { lane: opts.lane } : {}),
-    ...(opts.model ? { model: opts.model } : {}),
+    instruction,
+    ...(sessionTarget === null
+      ? {
+          ...{ history },
+          ...(cwd ? { cwd } : {}),
+          ...(opts.lane ? { lane: opts.lane } : {}),
+          ...(opts.model ? { model: opts.model } : {}),
+        }
+      : {
+          ...sessionTarget,
+          ...(opts.steer ? { deliver: 'steer' } : {}),
+        }),
   })
   const task = posted.json
+  if (task === null || typeof task !== 'object') {
+    console.error('task.mjs: 网关返回 ' + posted.status + '，响应不是 JSON —— profile 里的插件可能还是旧版本（session 目标需要 0.1.2+）')
+    console.error(String(posted.text || '').slice(0, 200))
+    finish(1)
+  }
   console.log(JSON.stringify({ phase: 'submitted', ...task }))
-  if (posted.status !== 202 || task.status === 'error') finish(posted.status === 202 ? 0 : 1)
+  if (task.reason === 'session-ambiguous' || task.reason === 'session-query-empty') {
+    console.error('task.mjs: ' + (task.error || task.reason))
+    if (Array.isArray(task.candidates) && task.candidates.length > 0) {
+      console.error('候选（改用 --session <id> 指定其一）:')
+      for (const c of task.candidates) console.error('  ' + c.sessionId + '  ' + c.snippet)
+    }
+    finish(4)
+  }
+  if (posted.status !== 202 || task.status === 'error') {
+    console.error('task.mjs: ' + (task.error || task.reason || 'submission failed'))
+    finish(1)
+  }
   if (!opts.wait) finish(0)
 
   const deadline = Date.now() + opts.timeoutSec * 1000
@@ -197,10 +247,13 @@ async function main() {
       console.log('=== DeepSeek 汇报 ===')
       console.log(status.result || status.error || '(无内容)')
       if (status.status === 'done') {
-        appendHistory([
-          { role: 'user', text: instruction },
-          { role: 'assistant', text: status.result || '(无输出)' },
-        ])
+        // session 目标的记忆就在那条会话里，不再往协作历史里塞一份。
+        if (sessionTarget === null) {
+          appendHistory([
+            { role: 'user', text: instruction },
+            { role: 'assistant', text: status.result || '(无输出)' },
+          ])
+        }
         if (opts.commit && cwd) gitCommit(cwd, '[task ' + task.taskId + '] ' + instruction)
       }
       finish(status.status === 'done' ? 0 : 1)

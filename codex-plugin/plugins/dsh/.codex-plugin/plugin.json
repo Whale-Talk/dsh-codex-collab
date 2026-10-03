@@ -1,6 +1,6 @@
 {
   "name": "dsh",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Codex 主导的双向编码协作插件：ChatGPT 把编码任务下发给本机 DeepSeek Harness 的持久编码子代理执行，DeepSeek 在共享工作目录 D:\\Harness 中写代码并实时回传进度与汇报，Codex 读文件验收、反馈修正，直到通过。",
   "author": {
     "name": "FuJackGao"

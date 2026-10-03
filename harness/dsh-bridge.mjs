@@ -2,18 +2,35 @@
  * dsh-bridge: Codex ↔ DeepSeek Harness 双向协作网关（持久化宿主插件）。
  *
  * 提供：
- *  - POST /api/dsh-bridge/task    编码任务（cwd/lane/model 参数化）
- *  - POST /api/dsh-bridge/review  双向评审（独立评审子代理，必须跑通构建/测试）
- *  - GET  /api/dsh-bridge/tasks   任务列表
- *  - POST /api/dsh-bridge/cancel  取消任务
- *  - GET  /api/dsh-bridge/status  任务状态
- *  - GET  /api/dsh-bridge/debug   调试信息
- *  - WS   /api/dsh-bridge/ws      实时推送（升级协议，供可选客户端使用）
+ *  - POST /api/dsh-bridge/task     派活：target.kind=worker 新建子代理（现有行为），
+ *                                  target.kind=session 接进已有会话
+ *  - POST /api/dsh-bridge/sessions 只读"找到会话"（search / resolve），不创建任何东西
+ *  - POST /api/dsh-bridge/review   双向评审（独立评审子代理，必须跑通构建/测试）
+ *  - GET  /api/dsh-bridge/tasks    任务列表
+ *  - POST /api/dsh-bridge/cancel   取消任务（session 目标默认拒绝，需 force）
+ *  - GET  /api/dsh-bridge/status   任务状态
+ *  - GET  /api/dsh-bridge/debug    调试信息
+ *  - WS   /api/dsh-bridge/ws       实时推送（升级协议，供可选客户端使用）
+ *
+ * "找到原对话"与"接通原对话"是两件事：前者是 /sessions 只读查询，后者是 /task
+ * 带 session 目标投递。session 目标**绝不**静默降级为新建——任何失败都返回稳定
+ * reason 且不创建任何会话/工作区。
  *
  * 与动态插件版本的关键差异：宿主插件运行在完整 Node 环境，
  * AbortSignal 可用，因此 followup 的 cold-resume 路径不再降级。
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import {
+  REASONS,
+  textOfBlocks,
+  assistantTextOf,
+  baselineOf,
+  extractNewAssistantText,
+  classifyTarget,
+  selectSession,
+  mapControllerError,
+  taskResponse,
+} from './session-target.mjs'
 
 export const name = 'dsh-bridge'
 
@@ -29,6 +46,9 @@ export async function apply(ctx) {
   const sessionPersistence = ctx.get('sessionPersistence')
   const workspaceRegistry = ctx.get('workspaceRegistry')
   const llm = ctx.get('llm')
+  // 已有会话的读写入口（由 dsh-web-app bundle 提供，与 webServer 同源）。
+  // 不放进 inject：缺失时降级为稳定的 session-controller-unavailable，而不是整个插件挂掉。
+  const sessionController = ctx.get('sessionController')
 
   // 清理历史版本可能泄漏的路由条目（重启前的动态插件、旧版本次插件）
   try {
@@ -39,6 +59,7 @@ export async function apply(ctx) {
       webServer.exact.delete('/api/dsh-bridge/review')
       webServer.exact.delete('/api/dsh-bridge/tasks')
       webServer.exact.delete('/api/dsh-bridge/cancel')
+      webServer.exact.delete('/api/dsh-bridge/sessions')
     }
     if (webServer.upgrades instanceof Map) webServer.upgrades.delete('/api/dsh-bridge/ws')
   } catch (e) {
@@ -63,17 +84,6 @@ export async function apply(ctx) {
       depth += 1
     }
     return s
-  }
-  const textOfBlocks = (blocks) => {
-    if (blocks === undefined || blocks === null) return ''
-    let out = ''
-    const list = Array.isArray(blocks) ? blocks : [blocks]
-    for (const b of list) {
-      if (b === undefined || b === null || typeof b !== 'object') continue
-      if (b.type === 'text' && typeof b.text === 'string') out += b.text
-      if (Array.isArray(b.content)) out += textOfBlocks(b.content)
-    }
-    return out
   }
   const qsOf = (req) => {
     const u = req.url || ''
@@ -371,10 +381,213 @@ export async function apply(ctx) {
     return { fallback: false, output: '', stopReason: '', fallbackNote: '' }
   }
 
-  const enqueue = async (instruction, incomingHistory, rawCwd, rawLane, modelAlias, kind) => {
+  // ---- 已有会话：解析 → 派发 → 观察 ----
+  const envMs = (name, fallback) => {
+    const v = Number(process.env[name])
+    return Number.isFinite(v) && v > 0 ? v : fallback
+  }
+  /** 派发后被接受、但迟迟没有真正开始跑（仍在排队）的容忍时间。 */
+  const SESSION_DISPATCH_TIMEOUT_MS = envMs('DSH_BRIDGE_SESSION_DISPATCH_TIMEOUT_MS', 120000)
+  /** 见过 running 之后，多久没有新助手文本算读完了。 */
+  const SESSION_QUIET_TIMEOUT_MS = envMs('DSH_BRIDGE_SESSION_QUIET_TIMEOUT_MS', 600000)
+  /** 单个会话任务的总预算上限。 */
+  const SESSION_TOTAL_TIMEOUT_MS = envMs('DSH_BRIDGE_SESSION_TOTAL_TIMEOUT_MS', 3600000)
+  // sessionTargets 以 sessionId 为键：同一会话同时只允许一个在途 bridge 任务。
+  // DSH 自己会排队，但我们无法可靠地把两次并发派的回报各自归属，所以宁可明确拒绝。
+  const sessionTargets = new Map()
+
+  const sessionSearch = async (query) => {
+    const value = await sessionController.search({ query }, signalOf())
+    const items = value !== undefined && value !== null && Array.isArray(value.items) ? value.items : []
+    return items.filter((it) => it !== null && typeof it === 'object' && typeof it.sessionId === 'string' && it.sessionId !== '')
+  }
+
+  /** 只读解析：query → search 选一；sessionId → 直接用。任何不确定性都返回 reason。 */
+  const resolveSessionTarget = async (target) => {
+    if (sessionController === undefined) {
+      return { ok: false, reason: REASONS.CONTROLLER_UNAVAILABLE, message: 'sessionController service is not mounted in this profile', candidates: [] }
+    }
+    let hits = []
+    if (target.sessionId === undefined) {
+      try {
+        hits = await sessionSearch(target.query)
+      } catch (e) {
+        return { ok: false, reason: REASONS.GATEWAY_INTERNAL, message: errText(e), candidates: [] }
+      }
+    }
+    const picked = selectSession(hits, target)
+    if (!picked.ok) return picked
+    let result
+    try {
+      result = await sessionController.resolveAgent(picked.sessionId)
+    } catch (e) {
+      return { ok: false, reason: mapControllerError(e), message: errText(e), candidates: picked.candidates }
+    }
+    if (result !== undefined && result !== null && result.error !== undefined) {
+      return { ok: false, reason: mapControllerError(result.error), message: errText(result.error), candidates: picked.candidates }
+    }
+    return { ok: true, sessionId: picked.sessionId, snippet: picked.snippet, candidates: picked.candidates }
+  }
+
+  const sessionPendingTask = (sessionId) => tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.target !== undefined && t.target.kind === 'session' && t.target.sessionId === sessionId)
+
+  const settleSessionTask = (record, status, fields) => {
+    if (record.settled) return
+    record.settled = true
+    if (record.abort !== undefined) { try { record.abort.abort() } catch (e) { /* ignore */ } }
+    sessionTargets.delete(record.sessionId)
+    const task = tasks.find((t) => t.taskId === record.taskId)
+    if (task === undefined) return
+    task.status = status
+    if (fields.result !== undefined) task.result = fields.result
+    if (fields.error !== undefined) task.error = fields.error
+    if (fields.reason !== undefined) task.reason = fields.reason
+    if (fields.stopReason !== undefined) task.stopReason = fields.stopReason
+    pushTask(task.taskId, status === 'done' ? 'result' : 'error', {
+      ...(task.result === undefined ? {} : { text: task.result }),
+      ...(task.error === undefined ? {} : { error: task.error }),
+      target: { kind: 'session', sessionId: record.sessionId },
+      ...(task.reason === undefined ? {} : { reason: task.reason }),
+    })
+  }
+
+  /** 收尾时以「持久日志 + 派发前基线」为准，避免只信流式片段。 */
+  const finishSessionTask = (record, stopReason) => {
+    if (record.settled) return
+    void (async () => {
+      let text = record.total
+      if (sessionQuery !== undefined) {
+        try {
+          const snap = await sessionQuery.readSession(record.sessionId)
+          const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
+          const extracted = extractNewAssistantText(events, record.baseline)
+          record.baseline = extracted.baseline
+          if (extracted.text.trim() !== '') text = record.total + extracted.text
+        } catch (e) {
+          console.error('[dsh-bridge] session result read failed:', errText(e).slice(0, 200))
+        }
+      }
+      settleSessionTask(record, 'done', { result: text.trim() !== '' ? text.trim() : '(无输出)', stopReason })
+    })()
+  }
+
+  const watchSessionTask = (record) => {
+    // 主路径：follow 增量流（不激活 Agent，也不重读整份日志——目标会话可能有几十 MB）。
+    const controller = new AbortController()
+    record.abort = controller
+    record.watcher = 'follow'
+    void (async () => {
+      try {
+        const stream = sessionController.follow({ address: { kind: 'session', sessionId: record.sessionId } }, controller.signal)
+        for await (const frame of stream) {
+          if (record.settled) break
+          if (frame === null || typeof frame !== 'object') continue
+          if (frame.type !== 'event') continue // snapshot 是派发前的历史，不作为本轮输出
+          const text = assistantTextOf(frame.event)
+          if (text === '') continue
+          record.total += text
+          record.activeSince = Date.now()
+          const task = tasks.find((t) => t.taskId === record.taskId)
+          if (task !== undefined && task.status === 'accepted') task.status = 'running'
+          pushTask(record.taskId, 'progress', { text, target: { kind: 'session', sessionId: record.sessionId } })
+        }
+      } catch (e) {
+        if (record.settled) return
+        // 降级：交给 2.5s 轮询（与子代理路径同一套解析），并在任务上标出来以便观测。
+        record.watcher = 'poll'
+        console.error('[dsh-bridge] follow unavailable, falling back to polling:', errText(e).slice(0, 200))
+      }
+    })()
+  }
+
+  /** 派发一条指令进已有会话。任何失败都不创建会话，只落一个 error 任务。 */
+  const dispatchToSession = async (instruction, target, deliver, notes, incomingHistory) => {
+    const task = {
+      taskId: uid(), kind: 'task', instruction,
+      target: { kind: 'session', sessionId: target.sessionId, query: target.query, snippet: target.snippet },
+      deliver, notes, status: 'accepted', time: Date.now(), result: undefined, error: undefined,
+      cwd: undefined, lane: undefined, bucketKey: undefined,
+    }
+    tasks.push(task)
+    if (tasks.length > 200) tasks.splice(0, tasks.length - 200)
+
+    const resolved = await resolveSessionTarget(target)
+    if (!resolved.ok) {
+      task.status = 'error'
+      task.error = resolved.message
+      task.reason = resolved.reason
+      task.candidates = resolved.candidates
+      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason })
+      return { task, failed: resolved }
+    }
+    task.target.sessionId = resolved.sessionId
+    if (resolved.snippet !== undefined) task.target.snippet = resolved.snippet
+    if (resolved.candidates.length > 0) task.candidates = resolved.candidates
+
+    const inFlight = sessionPendingTask(resolved.sessionId)
+    if (inFlight !== undefined && inFlight.taskId !== task.taskId) {
+      task.status = 'error'
+      task.error = 'another bridge task is already pending on this session'
+      task.reason = REASONS.BUSY
+      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, target: { kind: 'session', sessionId: resolved.sessionId } })
+      return { task, failed: { reason: REASONS.BUSY, message: task.error, candidates: [] } }
+    }
+
+    // 派发前取基线：结果只回报这一轮新产生的助手文本。
+    let baseline = { count: 0, textLen: 0 }
+    if (sessionQuery !== undefined) {
+      try {
+        const snap = await sessionQuery.readSession(resolved.sessionId)
+        const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
+        baseline = baselineOf(events)
+      } catch (e) {
+        console.error('[dsh-bridge] session baseline read failed:', errText(e).slice(0, 200))
+      }
+    }
+    const record = {
+      sessionId: resolved.sessionId, taskId: task.taskId, deliver, baseline,
+      total: '', sawRunning: false, activeSince: Date.now(), startedAt: Date.now(),
+      settled: false, abort: undefined, watcher: 'pending',
+    }
+    sessionTargets.set(resolved.sessionId, record)
+
+    try {
+      await sessionController.prompt({
+        requestId: task.taskId,
+        sessionId: resolved.sessionId,
+        mode: deliver,
+        content: [{ type: 'text', text: instruction }],
+      }, signalOf())
+    } catch (e) {
+      const reason = mapControllerError(e)
+      sessionTargets.delete(resolved.sessionId)
+      record.settled = true
+      task.status = 'error'
+      task.error = errText(e)
+      task.reason = reason
+      pushTask(task.taskId, 'error', { error: task.error, reason: reason, target: { kind: 'session', sessionId: resolved.sessionId } })
+      return { task, failed: { reason, message: task.error, candidates: [] } }
+    }
+
+    watchSessionTask(record)
+    pushTask(task.taskId, 'task-accepted', { target: { kind: 'session', sessionId: resolved.sessionId }, deliver, cwd: resolved.snippet })
+    return { task, failed: null }
+  }
+
+  const enqueue = async (instruction, incomingHistory, target, modelAlias, kind, deliver, notes) => {
     if (incomingHistory !== undefined) syncHistory(incomingHistory)
-    const cwd = normalizeCwd(rawCwd)
-    const lane = normalizeLane(rawLane)
+    if (target !== undefined && target.kind === 'session') {
+      // session 目标：不注册工作区、不建 owner、不建子代理，失败也不降级为新建。
+      const dispatched = await dispatchToSession(
+        instruction, target,
+        deliver === undefined ? 'queue' : deliver,
+        Array.isArray(notes) ? notes : [],
+        incomingHistory,
+      )
+      return dispatched.task
+    }
+    const cwd = normalizeCwd(target === undefined ? undefined : target.cwd)
+    const lane = normalizeLane(target === undefined ? undefined : target.lane)
     registerWorkspace(cwd)
     const bucket = bucketOf(cwd, lane)
     const requestedModel = await resolveModel(modelAlias)
@@ -385,7 +598,7 @@ export async function apply(ctx) {
       bucket.lastSeen = 0
       bucket.seenCount = 0
     }
-    const task = { taskId: uid(), kind, instruction, cwd, lane, bucketKey: bucket.key, status: 'accepted', time: Date.now(), result: undefined, error: undefined }
+    const task = { taskId: uid(), kind, instruction, cwd, lane, bucketKey: bucket.key, target: { kind: 'worker', cwd, lane }, status: 'accepted', time: Date.now(), result: undefined, error: undefined }
     tasks.push(task)
     if (tasks.length > 200) tasks.splice(0, tasks.length - 200)
     try {
@@ -415,7 +628,7 @@ export async function apply(ctx) {
     const cwd = normalizeCwd(rawCwd)
     const bucket = reviewerBucketOf(cwd)
     const instruction = ['【变更 diff】\n' + (typeof diff === 'string' && diff.trim() !== '' ? diff.slice(0, 60000) : '(未提供 diff)'), '【审查重点】\n' + (typeof focus === 'string' && focus.trim() !== '' ? focus.slice(0, 4000) : '(未指定,请按一般标准审查)')].join('\n\n')
-    const task = { taskId: uid(), kind: 'review', instruction, cwd, lane: '@review', bucketKey: bucket.key, status: 'accepted', time: Date.now(), result: undefined, error: undefined }
+    const task = { taskId: uid(), kind: 'review', instruction, cwd, lane: '@review', bucketKey: bucket.key, target: { kind: 'worker', cwd, lane: '@review' }, status: 'accepted', time: Date.now(), result: undefined, error: undefined }
     tasks.push(task)
     if (tasks.length > 200) tasks.splice(0, tasks.length - 200)
     try {
@@ -440,13 +653,7 @@ export async function apply(ctx) {
     return task
   }
 
-  const assistantTextOf = (event) => {
-    if (event === undefined || event === null || event.type !== 'assistant/message') return ''
-    const data = event.data
-    const msg = data && data.message !== undefined ? data.message : data
-    const content = msg && msg.content !== undefined ? msg.content : data && data.content
-    return textOfBlocks(content)
-  }
+  // assistantTextOf / textOfBlocks 由 session-target.mjs 提供（同一套语义，可单测）。
   const pollOne = async (bucket) => {
     if (bucket.childId === null || sessionQuery === undefined) return
     const hasPending = tasks.some((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
@@ -476,11 +683,67 @@ export async function apply(ctx) {
       }
     }
   }
+  // 会话任务的兜底：超时判定 + follow 不可用时的轮询降级。
+  const sweepSessionTargets = async () => {
+    for (const record of Array.from(sessionTargets.values())) {
+      if (record.settled) continue
+      const task = tasks.find((t) => t.taskId === record.taskId)
+      if (task === undefined) { settleSessionTask(record, 'cancelled', {}); continue }
+      if (task.status === 'cancelled') { record.settled = true; if (record.abort !== undefined) { try { record.abort.abort() } catch (e) { /* ignore */ } } sessionTargets.delete(record.sessionId); continue }
+      const now = Date.now()
+      if (record.watcher === 'poll' && sessionQuery !== undefined) {
+        try {
+          const snap = await sessionQuery.readSession(record.sessionId)
+          const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
+          const extracted = extractNewAssistantText(events, record.baseline)
+          record.baseline = extracted.baseline
+          if (extracted.text.trim() !== '') {
+            record.total += extracted.text
+            record.activeSince = now
+            if (task.status === 'accepted') task.status = 'running'
+            pushTask(record.taskId, 'progress', { text: extracted.text, target: { kind: 'session', sessionId: record.sessionId } })
+          }
+        } catch (e) { /* 读不到就下一轮再试 */ }
+      }
+      if (!record.sawRunning && now - record.startedAt > SESSION_DISPATCH_TIMEOUT_MS) {
+        settleSessionTask(record, 'error', { error: 'the session never started a turn after the prompt was accepted (it may still be queued)', reason: REASONS.NOT_ACCEPTED })
+        continue
+      }
+      if (record.sawRunning && record.activeSince > 0 && now - record.activeSince > SESSION_QUIET_TIMEOUT_MS) {
+        finishSessionTask(record, 'quiet-timeout')
+        continue
+      }
+      if (now - record.startedAt > SESSION_TOTAL_TIMEOUT_MS) {
+        settleSessionTask(record, 'error', { error: 'session task exceeded its total budget', reason: REASONS.TIMEOUT })
+      }
+    }
+  }
+
+  // 完成信号：会话从 running 回到 idle 即这一轮结束（follow 只负责流式进度）。
+  if (sessionController !== undefined) {
+    ctx.effect(() => {
+      const off = ctx.on('api-session/status', (sessionId, running) => {
+        const record = sessionTargets.get(sessionId)
+        if (record === undefined || record.settled) return
+        const task = tasks.find((t) => t.taskId === record.taskId)
+        if (running === true) {
+          record.sawRunning = true
+          record.activeSince = Date.now()
+          if (task !== undefined && task.status === 'accepted') task.status = 'running'
+          return
+        }
+        if (running === false && record.sawRunning) finishSessionTask(record, 'stop')
+      })
+      return () => { if (typeof off === 'function') off() }
+    })
+  }
+
   if (timer !== undefined) {
     ctx.effect(() => timer.interval(() => {
       void (async () => {
         for (const bucket of buckets.values()) await pollOne(bucket)
         for (const bucket of reviewerBuckets.values()) await pollOne(bucket)
+        await sweepSessionTargets()
       })()
     }, 2500))
   }
@@ -523,8 +786,83 @@ export async function apply(ctx) {
       if (parsed === null) return
       const instruction = parsed !== null && typeof parsed === 'object' && typeof parsed.instruction === 'string' ? parsed.instruction : ''
       if (instruction.trim() === '') { sendJson(res, 400, { error: 'missing instruction' }); return }
-      const task = await enqueue(instruction, parsed.history, parsed.cwd, parsed.lane, parsed.model, 'task')
-      sendJson(res, 202, { taskId: task.taskId, status: task.status, cwd: task.cwd, lane: task.lane, model: parsed.model || null })
+      const classified = classifyTarget(parsed)
+      if (!classified.ok) { sendJson(res, 400, { error: classified.message, reason: classified.reason }); return }
+      const task = await enqueue(instruction, parsed.history, classified.target, parsed.model, 'task', classified.deliver, classified.notes)
+      if (task.status === 'error') {
+        sendJson(res, 400, {
+          error: task.error,
+          reason: task.reason,
+          ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
+        })
+        return
+      }
+      sendJson(res, 202, {
+        ...taskResponse(task),
+        model: classified.target.kind === 'worker' ? (parsed.model || null) : null,
+      })
+    },
+  }))
+
+  // 只读"找到会话"：不创建、不投递、不激活 Agent（search/附件/历史页都不激活）。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/api/dsh-bridge/sessions',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
+      if (req.method !== 'POST' && req.method !== 'GET') { res.writeHead(405); res.end('POST or GET only'); return }
+      let parsed = {}
+      if (req.method === 'POST') {
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        parsed = body
+      } else {
+        parsed = qsOf(req)
+      }
+      if (sessionController === undefined) {
+        sendJson(res, 503, { error: 'sessionController service is not mounted in this profile', reason: REASONS.CONTROLLER_UNAVAILABLE })
+        return
+      }
+      const query = typeof parsed.query === 'string' && parsed.query.trim() !== '' ? parsed.query.trim() : undefined
+      const sessionId = typeof parsed.sessionId === 'string' && parsed.sessionId.trim() !== '' ? parsed.sessionId.trim() : undefined
+      if (query === undefined && sessionId === undefined) {
+        sendJson(res, 400, { error: 'query or sessionId required', reason: REASONS.INVALID_TARGET })
+        return
+      }
+      const limit = Math.min(Math.max(Number(parsed.limit) || 10, 1), 50)
+      try {
+        if (sessionId !== undefined) {
+          const resolved = await resolveSessionTarget({ kind: 'session', sessionId })
+          if (!resolved.ok) {
+            sendJson(res, 404, { error: resolved.message, reason: resolved.reason, candidates: resolved.candidates })
+            return
+          }
+          sendJson(res, 200, { items: [{ sessionId: resolved.sessionId, ...(resolved.snippet === undefined ? {} : { snippet: resolved.snippet }), agentAvailable: true }], hasMore: false })
+          return
+        }
+        const hits = await sessionSearch(query)
+        const items = hits.slice(0, limit).map((h) => ({
+          sessionId: h.sessionId,
+          snippet: typeof h.snippet === 'string' ? h.snippet.slice(0, 200) : '',
+        }))
+        if (parsed.inspect === true) {
+          // 只对前 5 条探能力：逐条 stat 会很贵，这里保持有界。
+          for (const item of items.slice(0, 5)) {
+            try {
+              const r = await sessionController.resolveAgent(item.sessionId)
+              const failed = r !== undefined && r !== null && r.error !== undefined
+              item.agentAvailable = !failed
+              if (failed) item.problem = mapControllerError(r.error)
+            } catch (e) {
+              item.agentAvailable = false
+              item.problem = mapControllerError(e)
+            }
+          }
+        }
+        sendJson(res, 200, { items, hasMore: hits.length > items.length, total: hits.length })
+      } catch (e) {
+        sendJson(res, 502, { error: errText(e), reason: mapControllerError(e) })
+      }
     },
   }))
 
@@ -546,7 +884,7 @@ export async function apply(ctx) {
     path: '/api/dsh-bridge/tasks',
     handler: async (req, res) => {
       if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
-      sendJson(res, 200, { tasks: tasks.slice(-50).map((t) => ({ taskId: t.taskId, kind: t.kind, cwd: t.cwd, lane: t.lane, status: t.status, time: t.time, instruction: t.instruction.slice(0, 200), error: t.error, fallback: t.fallback })) })
+      sendJson(res, 200, { tasks: tasks.slice(-50).map((t) => ({ taskId: t.taskId, kind: t.kind, cwd: t.cwd, lane: t.lane, target: t.target, deliver: t.deliver, status: t.status, time: t.time, instruction: t.instruction.slice(0, 200), error: t.error, reason: t.reason, fallback: t.fallback })) })
     },
   }))
 
@@ -562,6 +900,34 @@ export async function apply(ctx) {
       const task = tasks.find((t) => t.taskId === taskId)
       if (task === undefined) { sendJson(res, 404, { error: 'unknown taskId' }); return }
       if (task.status !== 'accepted' && task.status !== 'running') { sendJson(res, 200, { taskId, cancelled: false, status: task.status }); return }
+
+      // session 目标动的是用户自己的对话：取消会打断他正在跑的回合，因此必须显式 force。
+      if (task.target !== undefined && task.target.kind === 'session') {
+        if (parsed.force !== true) {
+          sendJson(res, 409, {
+            taskId,
+            cancelled: false,
+            reason: REASONS.CANCEL_REFUSED,
+            error: 'cancelling a session-target task interrupts the user\'s own turn; pass force: true to do it deliberately',
+          })
+          return
+        }
+        let cancelled = false
+        try {
+          await sessionController.cancel({ sessionId: task.target.sessionId }, signalOf())
+          cancelled = true
+        } catch (e) {
+          console.error('[dsh-bridge] session cancel failed:', errText(e).slice(0, 200))
+        }
+        task.status = 'cancelled'
+        task.cancelReason = 'cancelled by request (force)'
+        const record = sessionTargets.get(task.target.sessionId)
+        if (record !== undefined) settleSessionTask(record, 'cancelled', {})
+        pushTask(taskId, 'cancelled', { target: { kind: 'session', sessionId: task.target.sessionId } })
+        sendJson(res, 200, { taskId, cancelled: true, interrupted: cancelled, target: task.target })
+        return
+      }
+
       task.status = 'cancelled'
       task.cancelReason = 'cancelled by request'
       let interrupted = false
@@ -589,11 +955,25 @@ export async function apply(ctx) {
       if (taskId !== undefined && taskId !== '') {
         const task = tasks.find((t) => t.taskId === taskId)
         if (task === undefined) { sendJson(res, 404, { error: 'unknown taskId' }); return }
-        sendJson(res, 200, { taskId: task.taskId, status: task.status, kind: task.kind, cwd: task.cwd, lane: task.lane, instruction: task.instruction.slice(0, 300), result: task.result, error: task.error, fallback: task.fallback })
+        const record = task.target !== undefined && task.target.kind === 'session' ? sessionTargets.get(task.target.sessionId) : undefined
+        sendJson(res, 200, {
+          taskId: task.taskId, status: task.status, kind: task.kind, cwd: task.cwd, lane: task.lane,
+          target: task.target, deliver: task.deliver, instruction: task.instruction.slice(0, 300),
+          result: task.result, error: task.error, reason: task.reason, fallback: task.fallback,
+          ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
+          ...(record === undefined ? {} : { watcher: record.watcher, sawRunning: record.sawRunning }),
+        })
         return
       }
       const pending = tasks.filter((t) => t.status === 'accepted' || t.status === 'running').length
-      sendJson(res, 200, { pending, lanes: Array.from(buckets.keys()), reviewers: Array.from(reviewerBuckets.keys()), tasks: tasks.slice(-20).map((t) => ({ taskId: t.taskId, kind: t.kind, status: t.status, cwd: t.cwd, lane: t.lane })) })
+      sendJson(res, 200, {
+        pending,
+        lanes: Array.from(buckets.keys()),
+        reviewers: Array.from(reviewerBuckets.keys()),
+        sessions: Array.from(sessionTargets.keys()),
+        sessionController: sessionController !== undefined,
+        tasks: tasks.slice(-20).map((t) => ({ taskId: t.taskId, kind: t.kind, status: t.status, cwd: t.cwd, lane: t.lane, target: t.target, deliver: t.deliver })),
+      })
     },
   }))
 
@@ -602,7 +982,7 @@ export async function apply(ctx) {
     path: '/api/dsh-bridge/debug',
     handler: async (req, res) => {
       if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
-      const out = { pending: 0, historyCount: history.length, presets: [], providers: [], buckets: [], reviewers: [], models: knownModels, modelProvider, modelListError, workspaces: [] }
+      const out = { pending: 0, historyCount: history.length, presets: [], providers: [], buckets: [], reviewers: [], sessionController: sessionController !== undefined, sessionTargets: [], models: knownModels, modelProvider, modelListError, workspaces: [] }
       out.pending = tasks.filter((t) => t.status === 'accepted' || t.status === 'running').length
       try { out.providers = subagents.list() } catch (e) { out.providers = ['list failed: ' + errText(e)] }
       if (agentPresets !== undefined) {
@@ -619,6 +999,9 @@ export async function apply(ctx) {
       }
       for (const bucket of reviewerBuckets.values()) {
         out.reviewers.push({ cwd: bucket.cwd, childId: bucket.childId })
+      }
+      for (const record of sessionTargets.values()) {
+        out.sessionTargets.push({ sessionId: record.sessionId, taskId: record.taskId, deliver: record.deliver, watcher: record.watcher, sawRunning: record.sawRunning })
       }
       sendJson(res, 200, out)
     },
@@ -646,7 +1029,12 @@ export async function apply(ctx) {
               if (msg.type === 'ping') {
                 try { socket.write(JSON.stringify({ type: 'pong', time: Date.now() }) + '\n') } catch (e) {}
               } else if (msg.type === 'instruction' && typeof msg.text === 'string' && msg.text.trim() !== '') {
-                void enqueue(msg.text, msg.history, msg.cwd, msg.lane, msg.model, 'task')
+                const classified = classifyTarget(msg)
+                if (!classified.ok) {
+                  try { socket.write(JSON.stringify({ type: 'error', reason: classified.reason, error: classified.message, time: Date.now() }) + '\n') } catch (e) { /* drop */ }
+                } else {
+                  void enqueue(msg.text, msg.history, classified.target, msg.model, 'task', classified.deliver, classified.notes)
+                }
               } else if (msg.type === 'review') {
                 void submitReview(msg.cwd, msg.diff, msg.focus, msg.history)
               }
@@ -664,26 +1052,35 @@ export async function apply(ctx) {
   // ---- 原生工具（宿主全局工具层）----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'dsh_collab_send',
-    description: '向 Codex 协作频道发送一条编码指令,由编码子代理在指定工作目录执行(DeepSeek 侧入口)。指令用中文。',
+    description: '向 Codex 协作频道发送一条编码指令。默认新建编码子代理在指定工作目录执行;给出 sessionId 或 sessionQuery 时改为投递进那一条已有会话(会话自带的对话与上下文)。指令用中文。',
     parameters: {
       instruction: { type: 'string', required: true, description: '要交给编码子代理执行的指令。' },
-      cwd: { type: 'string', description: '工作目录(默认 ' + DEFAULT_WORKSPACE + ')。' },
+      cwd: { type: 'string', description: '工作目录(默认 ' + DEFAULT_WORKSPACE + ')。与 sessionId/sessionQuery 互斥。' },
       lane: { type: 'string', description: '并行通道名(默认 main,同目录不同 lane 并行)。' },
       model: { type: 'string', description: '模型别名: default | fast | pro。' },
+      sessionId: { type: 'string', description: '已有会话 id:把指令投递进这条会话,而不是新建。' },
+      sessionQuery: { type: 'string', description: '按标题/内容搜索已有会话(唯一命中才生效,多条会返回候选)。' },
+      deliver: { type: 'string', description: "投递方式: queue(默认,排队) 或 steer(插入当前回合)。" },
       wait: { type: 'boolean', description: '为 true 时等待结果(最长 15 分钟)。' },
     },
     output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
     async execute(args) {
-      const task = await enqueue(args.instruction, undefined, args.cwd, args.lane, args.model, 'task')
+      const classified = classifyTarget(args)
+      if (!classified.ok) return { ok: false, reason: classified.reason, error: classified.message }
+      const task = await enqueue(args.instruction, undefined, classified.target, args.model, 'task', classified.deliver, classified.notes)
+      if (task.status === 'error') {
+        return { ok: false, taskId: task.taskId, reason: task.reason, error: task.error, ...(task.candidates === undefined ? {} : { candidates: task.candidates }) }
+      }
+      const brief = { taskId: task.taskId, status: task.status, ...taskResponse(task) }
       if (args.wait !== true || timer === undefined) {
-        return { taskId: task.taskId, status: task.status, cwd: task.cwd, lane: task.lane }
+        return brief
       }
       const t0 = Date.now()
       while (task.status === 'accepted' || task.status === 'running') {
-        if (Date.now() - t0 > 900000) return { taskId: task.taskId, status: task.status, result: task.result, note: 'wait 超时' }
+        if (Date.now() - t0 > 900000) return { ...brief, status: task.status, result: task.result, note: 'wait 超时' }
         await timer.timeout(2500)
       }
-      return { taskId: task.taskId, status: task.status, cwd: task.cwd, lane: task.lane, result: task.result, error: task.error }
+      return { ...brief, status: task.status, result: task.result, error: task.error, reason: task.reason }
     },
   })))
 
@@ -720,7 +1117,12 @@ export async function apply(ctx) {
     for (const bucket of reviewerBuckets.values()) {
       if (bucket.handle !== null) { void bucket.handle.dispose() }
     }
+    for (const record of sessionTargets.values()) {
+      record.settled = true
+      if (record.abort !== undefined) { try { record.abort.abort() } catch (e) { /* ignore */ } }
+    }
+    sessionTargets.clear()
   })
 
-  console.log('[dsh-bridge] persistent gateway ready (host composition): task · review · tasks · cancel · status · debug · WS')
+  console.log('[dsh-bridge] persistent gateway ready (host composition): task(new|session) · sessions · review · tasks · cancel · status · debug · WS | sessionController=' + (sessionController !== undefined ? 'yes' : 'no'))
 }
