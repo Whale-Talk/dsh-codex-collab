@@ -21,7 +21,8 @@ dsh plugin --profile web add @whaletalk/dsh-codex-collab
 ## 维护约定
 
 - **版本与真身锁步**：本目录 `version` 必须等于仓库根 `package.json` 的 `version`（CI 会断言）。真身发新版时，这里同步改版本号。
-- **发布方式**：只在 `publish.yml` 的 `workflow_dispatch` 里发布，进 `alias/` 目录执行 `npm publish --provenance --access public`；不会随 tag 自动发布，避免版本错位。
+- **发布方式**：只在 `publish.yml` 的 `workflow_dispatch` 里发布（勾选 `publish_alias`），进 `alias/` 目录执行 `npm publish --provenance --access public`；不会随 tag 自动发布，避免版本错位。
+- **token 要求**：本包是**无 scope** 包，归属 npm 账号本人。`NPM_TOKEN` 若只是授权了 `@whaletalk` 组织的 granular token，发布会 403；这种情况下额外建一个「All packages」或 classic Automation token，存为仓库 secret **`NPM_TOKEN_ALIAS`** 即可（不设则回落 `NPM_TOKEN`）。
 
 ## License
 

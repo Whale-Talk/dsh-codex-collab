@@ -304,4 +304,9 @@ jobs:
         working-directory: alias/dsh-codex-collab
         run: npm publish --provenance --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # 别名是**无 scope** 包，归属 npm 账号本人，而不是 @whaletalk 组织。
+          # 只授权了组织 scope 的 granular token 在这里会被 403 拒绝
+          # （"You may not perform that action with these credentials"），
+          # 所以允许用一个「All packages」或 classic Automation token 覆盖：
+          # 设了 NPM_TOKEN_ALIAS 就用它，没设则回落到 NPM_TOKEN。
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_ALIAS || secrets.NPM_TOKEN }}
