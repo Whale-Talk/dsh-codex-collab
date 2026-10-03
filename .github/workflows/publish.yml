@@ -15,10 +15,6 @@ on:
         description: '只读检查 NPM_TOKEN 是否有效，不上传包'
         type: boolean
         default: false
-      publish_alias:
-        description: '发布无 scope 别名 dsh-codex-collab（不随 tag 自动发布）'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -189,60 +185,6 @@ jobs:
             console.log("patch ok:", rows.length, "row(s) on", sub);
           '
 
-      - name: 'Unscoped alias: manifest, patch row and re-export contract'
-        # `alias/dsh-codex-collab` is a thin forwarding package: DSH's client
-        # install box takes a bare name, and pnpm links only direct profile
-        # dependencies at the node_modules root, so the alias must route the
-        # row at ITS OWN subpath and re-export the real bridge from there.
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/alias-check.mjs" <<'JS'
-          import fs from 'node:fs'
-          const dir = 'alias/dsh-codex-collab'
-          const root = JSON.parse(fs.readFileSync('package.json', 'utf8'))
-          const alias = JSON.parse(fs.readFileSync(dir + '/package.json', 'utf8'))
-          const fail = (m) => { throw new Error(m) }
-          if (alias.name !== 'dsh-codex-collab') fail('alias name: ' + alias.name)
-          if (alias.version !== root.version) fail('alias version ' + alias.version + ' must track root ' + root.version)
-          if (alias.dsh?.bundle?.patch !== './cordis.patch.yml') fail('alias must declare dsh.bundle.patch')
-          if (alias.publishConfig?.access !== 'public') fail('alias publishConfig.access must be public')
-          const dep = (alias.dependencies || {})['@whaletalk/dsh-codex-collab']
-          if (dep !== '^' + root.version) fail('alias must depend on ^' + root.version + ', got ' + dep)
-          const patch = fs.readFileSync(dir + '/cordis.patch.yml', 'utf8')
-          const rows = patch.split('\n').filter((l) => /^\s*name:/.test(l))
-          if (rows.length !== 1) fail('alias patch must declare exactly one row, got ' + rows.length)
-          if (!rows[0].includes("'dsh-codex-collab/bridge'")) fail('alias row must name its own subpath: ' + rows[0].trim())
-          const bridge = fs.readFileSync(dir + '/bridge.mjs', 'utf8')
-          if (!bridge.includes("export * from '@whaletalk/dsh-codex-collab/bridge'")) {
-            fail('alias bridge must re-export the scoped bridge')
-          }
-          for (const f of ['bridge.mjs', 'cordis.patch.yml', 'README.md', 'LICENSE']) {
-            if (!fs.existsSync(dir + '/' + f)) fail('alias ships no ' + f)
-          }
-          console.log('alias ok:', alias.name + '@' + alias.version, '->', dep)
-          JS
-          node "$RUNNER_TEMP/alias-check.mjs"
-
-      - name: 'Unscoped alias: tarball carries the patch and the re-export'
-        run: |
-          set -euo pipefail
-          cd alias/dsh-codex-collab
-          npm pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/alias-pack.json"
-          cat > "$RUNNER_TEMP/alias-pack-check.mjs" <<'JS'
-          import fs from 'node:fs'
-          const meta = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/alias-pack.json', 'utf8'))[0]
-          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'))
-          const paths = new Set(meta.files.map((f) => f.path.replace(/^package\//, '')))
-          const need = ['package.json', 'cordis.patch.yml', 'bridge.mjs', 'README.md', 'LICENSE']
-          const missing = need.filter((n) => !paths.has(n))
-          if (missing.length) throw new Error('alias tarball missing: ' + missing.join(', '))
-          if (meta.name !== pkg.name || meta.version !== pkg.version) {
-            throw new Error('unexpected alias pack: ' + meta.name + '@' + meta.version)
-          }
-          console.log('alias tarball ok:', meta.filename, meta.entryCount + ' entries')
-          JS
-          node "$RUNNER_TEMP/alias-pack-check.mjs"
-
   publish:
     name: Publish
     needs: verify
@@ -272,41 +214,3 @@ jobs:
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  publish-alias:
-    name: Publish unscoped alias
-    needs: verify
-    # 别名只在手动派发时发布（tag 推送不触发），避免与真身版本错位；
-    # 版本锁步由 verify 与下面的断言共同保证。
-    if: inputs.publish_alias
-    runs-on: ubuntu-latest
-    environment: npm
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - name: Assert alias version tracks the root package
-        working-directory: alias/dsh-codex-collab
-        run: |
-          set -euo pipefail
-          ALIAS=$(node -p 'require("./package.json").version')
-          ROOT=$(node -p 'require("../../package.json").version')
-          if [ "$ALIAS" != "$ROOT" ]; then
-            echo "::error::alias version $ALIAS != root version $ROOT"
-            exit 1
-          fi
-          echo "alias/root versions aligned: $ALIAS"
-
-      - name: Publish dsh-codex-collab with provenance
-        working-directory: alias/dsh-codex-collab
-        run: npm publish --provenance --access public
-        env:
-          # 别名是**无 scope** 包，归属 npm 账号本人，而不是 @whaletalk 组织。
-          # 只授权了组织 scope 的 granular token 在这里会被 403 拒绝
-          # （"You may not perform that action with these credentials"），
-          # 所以允许用一个「All packages」或 classic Automation token 覆盖：
-          # 设了 NPM_TOKEN_ALIAS 就用它，没设则回落到 NPM_TOKEN。
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_ALIAS || secrets.NPM_TOKEN }}
