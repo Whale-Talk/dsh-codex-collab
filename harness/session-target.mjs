@@ -190,6 +190,34 @@ export const mapControllerError = (error) => {
   }
 }
 
+/**
+ * 从 SessionSummary 里取标题。
+ *
+ * 标题不在 summary 顶层：它来自投影缓存（`projections.values.title`），而且不同 DSH
+ * 版本可能给字符串或 `{ val }` 包装，两种都认。`list` 在**不激活 Agent、也不打开
+ * search 索引**的前提下读持久化 header 与投影缓存，因此在 search 被部署禁用
+ * （session-query 索引 openAt: "never"）时，它是唯一还能按标题找会话的路径。
+ */
+export const sessionTitleOf = (summary) => {
+  if (summary === null || typeof summary !== 'object') return ''
+  const projections = summary.projections
+  if (projections === null || typeof projections !== 'object') return ''
+  const values = projections.values
+  if (values === null || typeof values !== 'object') return ''
+  const title = values.title
+  if (typeof title === 'string') return title
+  if (title !== null && typeof title === 'object' && typeof title.val === 'string') return title.val
+  return ''
+}
+
+/** search 在本部署被禁用时的报错特征（session-query 索引 openAt: "never"）。 */
+export const looksLikeDisabledSearch = (error) => {
+  const text = error !== null && typeof error === 'object' && typeof error.message === 'string'
+    ? error.message
+    : String(error === undefined || error === null ? '' : error)
+  return /search is disabled/i.test(text)
+}
+
 /** 任务在 HTTP 行上的回显：调用方一眼能看出这次是"新建"还是"接进哪个会话"。 */
 export const taskResponse = (task) => {
   const out = { taskId: task.taskId, status: task.status, kind: task.kind }

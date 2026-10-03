@@ -29,6 +29,8 @@ import {
   classifyTarget,
   selectSession,
   mapControllerError,
+  sessionTitleOf,
+  looksLikeDisabledSearch,
   taskResponse,
 } from './session-target.mjs'
 
@@ -408,6 +410,44 @@ export async function apply(ctx) {
     return items.filter((it) => it !== null && typeof it === 'object' && typeof it.sessionId === 'string' && it.sessionId !== '')
   }
 
+  /**
+   * 退回路径：不打开 search 索引，直接遍历 list（读持久化 header + 投影缓存）。
+   * 有些部署把 session-query 索引配成 openAt: "never"，此时 search 永远失败，
+   * 而按标题找会话仍必须可用——list 就是不激活 Agent 也能拿到标题的那条路。
+   */
+  const sessionList = async (query) => {
+    const controller = sessionControllerNow()
+    if (controller === undefined) {
+      throw Object.assign(new Error('sessionController service is not mounted in this profile'), { code: 'bridge/no-controller' })
+    }
+    const needle = query.toLowerCase()
+    const value = await controller.list({}, signalOf())
+    const items = value !== undefined && value !== null && Array.isArray(value.items) ? value.items : []
+    const out = []
+    for (const summary of items) {
+      if (summary === null || typeof summary !== 'object' || typeof summary.sessionId !== 'string') continue
+      const title = sessionTitleOf(summary)
+      if (title !== '' && title.toLowerCase().includes(needle)) {
+        out.push({ sessionId: summary.sessionId, snippet: title })
+        continue
+      }
+      if (typeof summary.cwd === 'string' && summary.cwd !== '' && summary.cwd.toLowerCase().includes(needle)) {
+        out.push({ sessionId: summary.sessionId, snippet: summary.cwd })
+      }
+    }
+    return out
+  }
+
+  /** 先 search，失败就退回 list；返回 {hits, matchedBy} 让调用方看得见走了哪条路。 */
+  const sessionFind = async (query) => {
+    try {
+      return { hits: await sessionSearch(query), matchedBy: 'search' }
+    } catch (e) {
+      if (!looksLikeDisabledSearch(e)) throw e
+      return { hits: await sessionList(query), matchedBy: 'list' }
+    }
+  }
+
   /** 只读解析：query → search 选一；sessionId → 直接用。任何不确定性都返回 reason。 */
   const resolveSessionTarget = async (target) => {
     const controller = sessionControllerNow()
@@ -415,9 +455,12 @@ export async function apply(ctx) {
       return { ok: false, reason: REASONS.CONTROLLER_UNAVAILABLE, message: 'sessionController service is not mounted in this profile', candidates: [] }
     }
     let hits = []
+    let matchedBy = 'sessionId'
     if (target.sessionId === undefined) {
       try {
-        hits = await sessionSearch(target.query)
+        const found = await sessionFind(target.query)
+        hits = found.hits
+        matchedBy = found.matchedBy
       } catch (e) {
         return { ok: false, reason: REASONS.GATEWAY_INTERNAL, message: errText(e), candidates: [] }
       }
@@ -433,7 +476,7 @@ export async function apply(ctx) {
     if (result !== undefined && result !== null && result.error !== undefined) {
       return { ok: false, reason: mapControllerError(result.error), message: errText(result.error), candidates: picked.candidates }
     }
-    return { ok: true, sessionId: picked.sessionId, snippet: picked.snippet, candidates: picked.candidates }
+    return { ok: true, sessionId: picked.sessionId, snippet: picked.snippet, candidates: picked.candidates, matchedBy }
   }
 
   const sessionPendingTask = (sessionId) => tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.target !== undefined && t.target.kind === 'session' && t.target.sessionId === sessionId)
@@ -532,6 +575,7 @@ export async function apply(ctx) {
     task.target.sessionId = resolved.sessionId
     if (resolved.snippet !== undefined) task.target.snippet = resolved.snippet
     if (resolved.candidates.length > 0) task.candidates = resolved.candidates
+    if (resolved.matchedBy !== undefined) task.matchedBy = resolved.matchedBy
 
     const inFlight = sessionPendingTask(resolved.sessionId)
     if (inFlight !== undefined && inFlight.taskId !== task.taskId) {
@@ -846,6 +890,17 @@ export async function apply(ctx) {
       }
       const query = typeof parsed.query === 'string' && parsed.query.trim() !== '' ? parsed.query.trim() : undefined
       const sessionId = typeof parsed.sessionId === 'string' && parsed.sessionId.trim() !== '' ? parsed.sessionId.trim() : undefined
+      // create 是显式动作：为探针/一次性任务建一条空白会话，不去碰任何已有会话。
+      if (parsed.create === true) {
+        const cwd = typeof parsed.cwd === 'string' && parsed.cwd.trim() !== '' ? parsed.cwd.trim() : undefined
+        try {
+          const created = await controller.create(cwd === undefined ? {} : { cwd }, signalOf())
+          sendJson(res, 201, { sessionId: created !== undefined && created !== null ? created.sessionId : undefined, agentPreset: created === undefined || created === null ? undefined : created.agentPreset })
+        } catch (e) {
+          sendJson(res, 502, { error: errText(e), reason: mapControllerError(e) })
+        }
+        return
+      }
       if (query === undefined && sessionId === undefined) {
         sendJson(res, 400, { error: 'query or sessionId required', reason: REASONS.INVALID_TARGET })
         return
@@ -861,7 +916,9 @@ export async function apply(ctx) {
           sendJson(res, 200, { items: [{ sessionId: resolved.sessionId, ...(resolved.snippet === undefined ? {} : { snippet: resolved.snippet }), agentAvailable: true }], hasMore: false })
           return
         }
-        const hits = await sessionSearch(query)
+        // search 失败就退回 list：有些部署把 session-query 索引配成 openAt "never"。
+        const found = await sessionFind(query)
+        const hits = found.hits
         const items = hits.slice(0, limit).map((h) => ({
           sessionId: h.sessionId,
           snippet: typeof h.snippet === 'string' ? h.snippet.slice(0, 200) : '',
@@ -880,7 +937,7 @@ export async function apply(ctx) {
             }
           }
         }
-        sendJson(res, 200, { items, hasMore: hits.length > items.length, total: hits.length })
+        sendJson(res, 200, { items, hasMore: hits.length > items.length, total: hits.length, matchedBy: found.matchedBy })
       } catch (e) {
         sendJson(res, 502, { error: errText(e), reason: mapControllerError(e) })
       }
@@ -983,6 +1040,7 @@ export async function apply(ctx) {
           taskId: task.taskId, status: task.status, kind: task.kind, cwd: task.cwd, lane: task.lane,
           target: task.target, deliver: task.deliver, instruction: task.instruction.slice(0, 300),
           result: task.result, error: task.error, reason: task.reason, fallback: task.fallback,
+          ...(task.matchedBy === undefined ? {} : { matchedBy: task.matchedBy }),
           ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
           ...(record === undefined ? {} : { watcher: record.watcher, sawRunning: record.sawRunning }),
         })

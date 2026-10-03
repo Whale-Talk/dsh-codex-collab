@@ -84,5 +84,7 @@ dsh-task --cancel <taskId> --force     # 取消 session 目标任务（会打断
 
 - 连接失败：DeepSeek Harness 未运行（网关应监听本机端口，默认 3080；挂在 web/desktop profile 时也可能就是 GUI 的端口）。
 - 派 session 任务返回 `session-writer-held` / `session-busy`：那条会话被别的写入方或另一个 bridge 任务占用；稍后重试，或改用 worker 目标。
+- 返回 `session-busy: owned by subagent routing`：那是子代理会话，**不能作为投递目标**；只能接普通会话。
 - 返回 `session-not-activatable` / `session-archived`：该会话当前接不了（冷会话未能激活，或已归档）；请用户先在客户端打开它，或解除归档。
+- 某些部署禁用了搜索（会话索引 `openAt: never`）：`--sessions` 会自动退回 `list` + 标题投影匹配，响应里的 `matchedBy` 会写 `list`。
 - 读不到 `--cwd` 目录：提示用户在 Codex 设置中把该目录加入可访问/可写目录。

@@ -14,6 +14,8 @@ import {
   classifyTarget,
   selectSession,
   mapControllerError,
+  sessionTitleOf,
+  looksLikeDisabledSearch,
   taskResponse,
 } from '../harness/session-target.mjs'
 
@@ -183,4 +185,22 @@ test('taskResponse: worker 与 session 各自回显目标，并带上 notes', ()
   })
   assert.deepEqual(session.target, { kind: 'session', sessionId: 'session-8d481ad9', deliver: 'steer', snippet: '按文档启动OKX策略实验计划' })
   assert.deepEqual(session.notes, ['history ignored for session targets'])
+})
+
+// ------------------------------------- search 被禁用时的标题回退（list 路径）
+test('sessionTitleOf: 认字符串与 { val } 包装，缺投影时返回空串', () => {
+  assert.equal(sessionTitleOf({ projections: { values: { title: '按文档启动OKX策略实验计划' } } }), '按文档启动OKX策略实验计划')
+  assert.equal(sessionTitleOf({ projections: { values: { title: { val: '包装形式' } } } }), '包装形式')
+  assert.equal(sessionTitleOf({ sessionId: 'x' }), '')
+  assert.equal(sessionTitleOf({ projections: { values: { title: { ver: 1, seq: 3 } } } }), '')
+  assert.equal(sessionTitleOf({ projections: {} }), '')
+  assert.equal(sessionTitleOf(null), '')
+})
+
+test('looksLikeDisabledSearch: 只认"search is disabled"，不吞其他错误', () => {
+  const disabled = new Error('SessionQueryError: session search is disabled: this deployment configures the session-query index with openAt "never"')
+  assert.equal(looksLikeDisabledSearch(disabled), true)
+  assert.equal(looksLikeDisabledSearch(new Error('network down')), false)
+  assert.equal(looksLikeDisabledSearch(undefined), false)
+  assert.equal(looksLikeDisabledSearch({ message: 'search is disabled' }), true)
 })
