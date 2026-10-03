@@ -6,7 +6,7 @@
 //      客户端（Secure MCP Tunnel / cloudflared）桥接给 ChatGPT 等远程产品。
 const GATEWAY = process.env.DSH_BRIDGE_URL || 'http://127.0.0.1:3080'
 const SERVER_NAME = 'dsh-bridge'
-const SERVER_VERSION = '0.1.2'
+const SERVER_VERSION = '0.1.3'
 const PROTOCOL_VERSION = '2024-11-05'
 
 const log = (...args) => console.error('[dsh-mcp]', ...args)

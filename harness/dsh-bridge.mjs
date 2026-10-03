@@ -46,9 +46,11 @@ export async function apply(ctx) {
   const sessionPersistence = ctx.get('sessionPersistence')
   const workspaceRegistry = ctx.get('workspaceRegistry')
   const llm = ctx.get('llm')
-  // 已有会话的读写入口（由 dsh-web-app bundle 提供，与 webServer 同源）。
-  // 不放进 inject：缺失时降级为稳定的 session-controller-unavailable，而不是整个插件挂掉。
-  const sessionController = ctx.get('sessionController')
+  // 已有会话的读写入口。**必须惰性取**：@deepseek-ai/dsh-api-session-controller 的
+  // sessionController 由组合异步注册（DSH 启动日志里它先处于 waiting for services），
+  // 在 apply() 时捕获会永久拿到 undefined。每次使用时现取；缺失时返回稳定的
+  // session-controller-unavailable，而不是让整个插件挂掉。
+  const sessionControllerNow = () => ctx.get('sessionController')
 
   // 清理历史版本可能泄漏的路由条目（重启前的动态插件、旧版本次插件）
   try {
@@ -397,14 +399,19 @@ export async function apply(ctx) {
   const sessionTargets = new Map()
 
   const sessionSearch = async (query) => {
-    const value = await sessionController.search({ query }, signalOf())
+    const controller = sessionControllerNow()
+    if (controller === undefined) {
+      throw Object.assign(new Error('sessionController service is not mounted in this profile'), { code: 'bridge/no-controller' })
+    }
+    const value = await controller.search({ query }, signalOf())
     const items = value !== undefined && value !== null && Array.isArray(value.items) ? value.items : []
     return items.filter((it) => it !== null && typeof it === 'object' && typeof it.sessionId === 'string' && it.sessionId !== '')
   }
 
   /** 只读解析：query → search 选一；sessionId → 直接用。任何不确定性都返回 reason。 */
   const resolveSessionTarget = async (target) => {
-    if (sessionController === undefined) {
+    const controller = sessionControllerNow()
+    if (controller === undefined) {
       return { ok: false, reason: REASONS.CONTROLLER_UNAVAILABLE, message: 'sessionController service is not mounted in this profile', candidates: [] }
     }
     let hits = []
@@ -419,7 +426,7 @@ export async function apply(ctx) {
     if (!picked.ok) return picked
     let result
     try {
-      result = await sessionController.resolveAgent(picked.sessionId)
+      result = await controller.resolveAgent(picked.sessionId)
     } catch (e) {
       return { ok: false, reason: mapControllerError(e), message: errText(e), candidates: picked.candidates }
     }
@@ -478,7 +485,9 @@ export async function apply(ctx) {
     record.watcher = 'follow'
     void (async () => {
       try {
-        const stream = sessionController.follow({ address: { kind: 'session', sessionId: record.sessionId } }, controller.signal)
+        const controllerRef = sessionControllerNow()
+        if (controllerRef === undefined) throw new Error('sessionController is not mounted')
+        const stream = controllerRef.follow({ address: { kind: 'session', sessionId: record.sessionId } }, controller.signal)
         for await (const frame of stream) {
           if (record.settled) break
           if (frame === null || typeof frame !== 'object') continue
@@ -552,7 +561,17 @@ export async function apply(ctx) {
     sessionTargets.set(resolved.sessionId, record)
 
     try {
-      await sessionController.prompt({
+      const controllerRef = sessionControllerNow()
+      if (controllerRef === undefined) {
+        sessionTargets.delete(resolved.sessionId)
+        record.settled = true
+        task.status = 'error'
+        task.error = 'sessionController service is not mounted in this profile'
+        task.reason = REASONS.CONTROLLER_UNAVAILABLE
+        pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, target: { kind: 'session', sessionId: resolved.sessionId } })
+        return { task, failed: { reason: task.reason, message: task.error, candidates: [] } }
+      }
+      await controllerRef.prompt({
         requestId: task.taskId,
         sessionId: resolved.sessionId,
         mode: deliver,
@@ -720,7 +739,8 @@ export async function apply(ctx) {
   }
 
   // 完成信号：会话从 running 回到 idle 即这一轮结束（follow 只负责流式进度）。
-  if (sessionController !== undefined) {
+  // 订阅的是 ctx 上的事件，与服务何时注册无关，所以不设门禁。
+  {
     ctx.effect(() => {
       const off = ctx.on('api-session/status', (sessionId, running) => {
         const record = sessionTargets.get(sessionId)
@@ -819,8 +839,9 @@ export async function apply(ctx) {
       } else {
         parsed = qsOf(req)
       }
-      if (sessionController === undefined) {
-        sendJson(res, 503, { error: 'sessionController service is not mounted in this profile', reason: REASONS.CONTROLLER_UNAVAILABLE })
+      const controller = sessionControllerNow()
+      if (controller === undefined) {
+        sendJson(res, 503, { error: 'sessionController service is not mounted yet (it registers asynchronously after startup; retry shortly)', reason: REASONS.CONTROLLER_UNAVAILABLE })
         return
       }
       const query = typeof parsed.query === 'string' && parsed.query.trim() !== '' ? parsed.query.trim() : undefined
@@ -849,7 +870,7 @@ export async function apply(ctx) {
           // 只对前 5 条探能力：逐条 stat 会很贵，这里保持有界。
           for (const item of items.slice(0, 5)) {
             try {
-              const r = await sessionController.resolveAgent(item.sessionId)
+              const r = await controller.resolveAgent(item.sessionId)
               const failed = r !== undefined && r !== null && r.error !== undefined
               item.agentAvailable = !failed
               if (failed) item.problem = mapControllerError(r.error)
@@ -914,7 +935,9 @@ export async function apply(ctx) {
         }
         let cancelled = false
         try {
-          await sessionController.cancel({ sessionId: task.target.sessionId }, signalOf())
+          const controller = sessionControllerNow()
+          if (controller === undefined) throw new Error('sessionController service is not mounted in this profile')
+          await controller.cancel({ sessionId: task.target.sessionId }, signalOf())
           cancelled = true
         } catch (e) {
           console.error('[dsh-bridge] session cancel failed:', errText(e).slice(0, 200))
@@ -971,7 +994,7 @@ export async function apply(ctx) {
         lanes: Array.from(buckets.keys()),
         reviewers: Array.from(reviewerBuckets.keys()),
         sessions: Array.from(sessionTargets.keys()),
-        sessionController: sessionController !== undefined,
+        sessionController: sessionControllerNow() !== undefined,
         tasks: tasks.slice(-20).map((t) => ({ taskId: t.taskId, kind: t.kind, status: t.status, cwd: t.cwd, lane: t.lane, target: t.target, deliver: t.deliver })),
       })
     },
@@ -982,7 +1005,15 @@ export async function apply(ctx) {
     path: '/api/dsh-bridge/debug',
     handler: async (req, res) => {
       if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
-      const out = { pending: 0, historyCount: history.length, presets: [], providers: [], buckets: [], reviewers: [], sessionController: sessionController !== undefined, sessionTargets: [], models: knownModels, modelProvider, modelListError, workspaces: [] }
+      // services 是现场探测（不是 apply 时的快照）：sessionController 可能晚于本插件注册，
+      // 这份清单能在"接不上会话"时直接告诉我们到底缺哪个服务。
+      const probe = (name) => { try { return ctx.get(name) !== undefined } catch (e) { return false } }
+      const out = {
+        pending: 0, historyCount: history.length, presets: [], providers: [], buckets: [], reviewers: [],
+        sessionController: probe('sessionController'),
+        services: Object.fromEntries(['sessionController', 'connection', 'sessionQuery', 'sessionPersistence', 'workspaceRegistry', 'agents', 'subagents', 'agentPresets', 'timer', 'llm'].map((n) => [n, probe(n)])),
+        sessionTargets: [], models: knownModels, modelProvider, modelListError, workspaces: [],
+      }
       out.pending = tasks.filter((t) => t.status === 'accepted' || t.status === 'running').length
       try { out.providers = subagents.list() } catch (e) { out.providers = ['list failed: ' + errText(e)] }
       if (agentPresets !== undefined) {
@@ -1124,5 +1155,5 @@ export async function apply(ctx) {
     sessionTargets.clear()
   })
 
-  console.log('[dsh-bridge] persistent gateway ready (host composition): task(new|session) · sessions · review · tasks · cancel · status · debug · WS | sessionController=' + (sessionController !== undefined ? 'yes' : 'no'))
+  console.log('[dsh-bridge] persistent gateway ready (host composition): task(new|session) · sessions · review · tasks · cancel · status · debug · WS | sessionController=' + (sessionControllerNow() !== undefined ? 'yes' : 'late-bound (registers asynchronously)'))
 }
