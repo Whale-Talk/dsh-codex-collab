@@ -75,6 +75,28 @@ jobs:
             console.log("contract ok:", p.name, p.version);
           '
 
+      - name: Version strings move together
+        # package.json, the Codex plugin manifest and the MCP server's advertised
+        # version are three copies of one number. v0.1.0 shipped them as
+        # 0.1.0 / 0.1.0 / 0.2.0; fail the release instead of drifting again.
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/version-check.mjs" <<'JS'
+          import fs from 'node:fs'
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          const plugin = JSON.parse(fs.readFileSync('codex-plugin/plugins/dsh/.codex-plugin/plugin.json', 'utf8'))
+          const mcp = fs.readFileSync('mcp/dsh-mcp.mjs', 'utf8')
+          const advertised = /SERVER_VERSION = '([^']+)'/.exec(mcp)?.[1]
+          if (plugin.version !== pkg.version) {
+            throw new Error(`plugin.json ${plugin.version} != package.json ${pkg.version}`)
+          }
+          if (advertised !== pkg.version) {
+            throw new Error(`dsh-mcp SERVER_VERSION ${advertised} != package.json ${pkg.version}`)
+          }
+          console.log('versions aligned:', pkg.version, '| plugin.json', plugin.version, '| dsh-mcp', advertised)
+          JS
+          node "$RUNNER_TEMP/version-check.mjs"
+
       - name: Pack and assert tarball contents
         run: |
           set -euo pipefail
