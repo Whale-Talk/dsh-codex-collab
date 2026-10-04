@@ -6,38 +6,51 @@
 
 **Codex 主导，DeepSeek 执行，Codex 验收。** 一个插件体系，让 ChatGPT（Codex）像项目经理一样把编码任务派给本机 DeepSeek Harness 的编码子代理，实时回传结果，读文件验收，并由独立评审员实际跑通构建/测试后出具评审报告。
 
+派活有**两种目标**，必须显式选一种——"接进用户正在用的那条对话"和"新建一个干活的子代理"是两件事：
+
+| 目标 | 什么时候用 | 效果 |
+|---|---|---|
+| `worker`（默认） | 全新任务、独立项目目录 | 在 `--cwd` 里新建持久编码子代理（多工作区 · 多 lane · fast/pro 模型） |
+| `session` | 用户已经在某条对话里推进这件事，你只是替他继续 | 指令**投递进那条会话**，沿用它的上下文，**不新建会话/工作区** |
+
 ```
 Codex 工作区 (ChatGPT)
-   │  派活 / 评审 / 验收
+   │  dsh_task / dsh_sessions / dsh_review / dsh_read_file
    ▼
-DeepSeek Harness 网关 ── 编码子代理（多工作区、多 lane、fast/pro 模型）
-   │                     独立评审子代理（必须跑通构建/测试）
-   ▼
-共享工作目录（任意目录，--cwd 指定）
+DeepSeek Harness 网关 /api/dsh-bridge
+   ├─ worker 目标 ──→ 新建编码子代理（多工作区 · 多 lane · fast/pro）─┐
+   ├─ session 目标 ─→ 已有那条会话（prompt 投递，queue / steer）  ──┤
+   └─ 独立评审子代理（必须跑通构建/测试）───────────────────────────┴→ 共享目录 / 原会话
 ```
 
 ```mermaid
 flowchart LR
     subgraph Codex["Codex (ChatGPT) — 项目经理 + 验收员"]
-        A1[dsh_task 派活]
-        A2[dsh_review 评审]
-        A3[dsh_read_file 验收]
+        A1[dsh_sessions 找会话]
+        A2[dsh_task 派活]
+        A3[dsh_review 评审]
+        A4[dsh_read_file 验收]
     end
     subgraph DSH["DeepSeek Harness"]
         B1[HTTP 网关 /api/dsh-bridge]
-        B2[编码子代理<br/>多工作区 · 多 lane · fast/pro]
-        B3[独立评审子代理<br/>必须跑通构建/测试]
+        B2[worker 目标<br/>新建编码子代理]
+        B3[session 目标<br/>投递进已有会话]
+        B4[独立评审子代理<br/>必须跑通构建/测试]
     end
-    subgraph FS["共享工作目录"]
-        C1[任意项目目录]
+    subgraph FS["工作现场"]
+        C1[共享工作目录]
+        C2[已有会话与其上下文]
     end
-    A1 --> B1
+    A1 -->|只读查找| B1
     A2 --> B1
-    A3 --> C1
+    A3 --> B1
+    A4 --> C1
     B1 --> B2 --> C1
-    B1 --> B3 --> C1
+    B1 --> B3 --> C2
+    B1 --> B4 --> C1
     B2 -.实时回传汇报.-> B1
-    B1 -.任务结果.-> A1
+    B3 -.实时回传汇报.-> B1
+    B1 -.任务结果.-> A2
 ```
 
 ---
@@ -48,7 +61,9 @@ flowchart LR
 |---|---|---|
 | `codex-plugin/` | Codex 本地市场插件包 | 标准 marketplace 结构（`.agents/plugins/marketplace.json` + 插件目录），含协作技能 `dsh-collab` |
 | `mcp/dsh-mcp.mjs` | MCP 服务器（零依赖 Node） | stdio 传输（Codex `[mcp_servers]` 直连）+ Streamable HTTP 传输（`--http`，供 Secure MCP Tunnel / cloudflared 桥接 ChatGPT）；6 个工具：`dsh_task` / `dsh_sessions` / `dsh_task_status` / `dsh_task_cancel` / `dsh_review` / `dsh_read_file` |
-| `harness/dsh-bridge.mjs` | DeepSeek Harness 宿主组合网关插件 | 提供 HTTP 网关（`/api/dsh-bridge/*`）、WS 推送、原生工具，管理编码/评审子代理会话。**必须装进 harness 宿主组合**（见下文） |
+| `harness/dsh-bridge.mjs` | DeepSeek Harness 宿主组合网关插件 | 提供 HTTP 网关（`/api/dsh-bridge/*`）、WS 推送、原生工具；管理编码/评审子代理，并把任务投递进已有会话。**必须装进 harness 宿主组合**（见下文） |
+| `harness/session-target.mjs` | 会话目标的纯决策层 | 目标判定、候选挑选（0/1/N 不猜）、RemoteError→稳定 reason、基线切分、汇报选文。无 DSH import，可单测；`dsh-bridge.mjs` 依赖它，**两个文件必须一起部署** |
+| `test/` | 25 项 Node 测试 | `session-target` 纯函数单测 + `dsh-bridge` 路由级回归测试（假 DSH 运行时加载真实 bridge）。CI 每次都跑 |
 | `cordis.patch.yml` | bundle patch | 把网关插件挂进 DSH 宿主组合；`dsh.bundle.patch` 指向它，所以 `dsh plugin add` 能自动 reconcile |
 
 ## 功能
@@ -69,7 +84,8 @@ flowchart LR
 
 ```sh
 # 1) 网关插件装进 harness profile（自动 reconcile bundles，无需手工复制文件）
-dsh plugin --profile web add @whaletalk/dsh-codex-collab
+dsh plugin --profile desktop add @whaletalk/dsh-codex-collab
+#    ↑ DSH 客户端用的就是 desktop profile；纯 Web 部署换成 --profile web
 
 # 2) MCP 服务器交给 Codex
 npm install -g @whaletalk/dsh-codex-collab
@@ -81,9 +97,27 @@ npm install -g @whaletalk/dsh-codex-collab
 [mcp_servers.dsh]
 command = 'dsh-mcp'
 startup_timeout_sec = 120
+env = { DSH_BRIDGE_URL = "http://127.0.0.1:3080" }   # 见下方"端口"；不写则默认 3080
 ```
 
-装完**必须重启 profile 进程**——`dsh plugin add` 改的是 bundles 列表与 node_modules，HMR 不监控这两处。
+**端口**：网关挂在 profile 的 `webServer` 上，地址取决于 profile 怎么起的——独立 harness 通常 `3080`，而 DSH 客户端里就是 **GUI 自己的端口**（例如 `http://127.0.0.1:19387`）。MCP 与 CLI 都用 `DSH_BRIDGE_URL` 找网关，指错只会看到连接失败或 401。验证：
+
+```sh
+curl http://127.0.0.1:3080/api/dsh-bridge/status
+```
+
+装完**必须重启 profile 进程**——`dsh plugin add` 改的是 bundles 列表与 node_modules，HMR 不监控这两处；**替换包内容也不会热重载**（ESM 缓存），只有重启进程才加载新版本。
+
+### 升级到新版本（有坑，照做）
+
+```sh
+# 1) 带精确版本号安装：不带版本号时 lockfile 会把旧版按回来
+dsh plugin --profile desktop add @whaletalk/dsh-codex-collab@<新版本>
+# 2) 重启 profile 进程：不重启不会加载新的 JS 模块
+```
+
+- **不要用"卸载 → 重装"**：卸载会把这个包从 `dsh.profile.bundles` 移除；重装后若没被重新选中，插件根本不会挂载（表现：所有 `/api/dsh-bridge/*` 都落到网关鉴权层返回 **401**）。真遇到了就在客户端插件页把它的开关打开。
+- **刚发布的版本约 24 小时内装不上**：profile 的 pnpm 带 `minimumReleaseAge` 供应链冷却（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`）。管理器会把它写进 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 才放行；手工安装可临时加 `--config.minimumReleaseAge=0`。
 
 > 本包只提供 bundle patch，不含 profile 之外的强依赖：`@deepseek-ai/dsh-tools` 是 optional peer，由 DSH 安装树在运行时提供。因此 `npm install` 不会去 registry 拉它，也不会因它缺失而报错。
 
@@ -92,13 +126,15 @@ startup_timeout_sec = 120
 
 ### 1. DeepSeek Harness 网关（必需，后端）
 
-把 `harness/dsh-bridge.mjs` 复制到你的 dsh profile 目录（例如 `$DSH_HOME/profiles/web/`），并在该目录的 `cordis.patch.yml` 中追加：
+把 **`harness/` 整个目录**复制到你的 dsh profile 目录（例如 `$DSH_HOME/profiles/web/` 下的 `harness/`），并在该目录的 `cordis.patch.yml` 中追加：
 
 ```yaml
 - insert:
     - id: dsh-bridge
-      name: './dsh-bridge.mjs'
+      name: './harness/dsh-bridge.mjs'
 ```
+
+> `dsh-bridge.mjs` 会 `import './session-target.mjs'`——**两个文件必须在一起**，只复制前者会直接加载失败。
 
 重启 harness。默认共享工作目录为 `D:\Harness`，可用环境变量 `DSH_BRIDGE_WORKSPACE` 覆盖。验证：
 
@@ -106,7 +142,7 @@ startup_timeout_sec = 120
 GET http://127.0.0.1:3080/api/dsh-bridge/status
 ```
 
-> 手工方式必须用相对路径 `'./dsh-bridge.mjs'`，因为文件就在 profile 目录里；npm 方式则用包子路径 `@whaletalk/dsh-codex-collab/bridge`，两者不要混用。
+> 手工方式必须用相对路径（文件就在 profile 目录里）；npm 方式则用包子路径 `@whaletalk/dsh-codex-collab/bridge`，两者不要混用。
 
 ### 2. Codex 侧（二选一或都用）
 
@@ -158,12 +194,27 @@ tunnel-client run --profile dsh
 
 **Codex 工作区会话**（MCP 工具就绪后）：
 
-> 用 dsh_task 让 DeepSeek 生成一个随机密码 CLI + 测试 + README，放在当前项目目录，完成后你用 dsh_read_file 验收，再 dsh_review 评审
+> **新建子代理**：用 dsh_task 让 DeepSeek 生成一个随机密码 CLI + 测试 + README，放在当前项目目录，完成后你用 dsh_read_file 验收，再 dsh_review 评审
+>
+> **接进原对话**：先用 dsh_sessions 按标题找到用户正在用的那条会话，再用 dsh_task 带 sessionId 把下一步指令投递进去（不要新建会话）
+
+**MCP 工具**（Codex 侧首选，工具名带 `mcp__dsh__` 前缀）：
+
+```jsonc
+// 1) 找到会话（只读）
+dsh_sessions({ "query": "按文档启动OKX策略实验计划" })
+// → { "items": [{ "sessionId": "session-8d481ad9-…", "snippet": "按文档启动OKX策略实验计划",
+//                 "agentAvailable": true }], "matchedBy": "list" }
+
+// 2) 投递进那条会话
+dsh_task({ "instruction": "继续推进第 3 步…", "sessionId": "session-8d481ad9-…" })
+// deliver 可选 "queue"（默认，排队）或 "steer"（插入当前回合）
+```
 
 **命令行**（npm 安装后直接用；源码方式用 `node <脚本路径>`）：
 
 ```bash
-# 新建子代理（原有行为）
+# 新建子代理（默认行为）
 dsh-task --in "<指令>" --cwd "<目录>" [--lane backend] [--model fast|pro] [--commit]
 
 # 接进已有会话：先找，再派
@@ -180,11 +231,14 @@ dsh-task --list | --status <taskId> | --cancel <taskId> [--force]
 ```bash
 # 1) 找到（只读，不创建任何东西）
 dsh-task --sessions "按文档启动OKX策略实验计划"
-# → {"items":[{"sessionId":"session-8d481ad9-...","snippet":"@okx-strategy-lab/ 开始按照文档进行计划"}]}
+# → {"items":[{"sessionId":"session-8d481ad9-…","snippet":"按文档启动OKX策略实验计划",
+#              "agentAvailable":true}],"total":1,"matchedBy":"list"}
 
-# 2) 接通（指令投递进那条会话，跑完把这一轮的助手回复作为汇报返回）
-dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-..."
+# 2) 接通（投递进那条会话；这一轮的助手回复作为汇报返回，只回报本轮新增文本）
+dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-…"
 ```
+
+`matchedBy` 说明"找到"走了哪条路：`search` = 会话搜索索引；`list` = 索引被部署禁用时退回遍历列表 + 标题投影（都不激活 Agent）。
 
 失败一律返回稳定 `reason` 且**不创建任何会话/工作区**：`session-query-empty`（没命中）、`session-ambiguous`（多条命中，附 `candidates`）、`session-not-found`、`session-busy`、`session-writer-held`（会话被别的写入方占用）、`session-archived`、`session-not-accepted`、`session-timeout`、`session-cancel-refused`（取消会话目标默认被拒，需 `--force`）。
 
@@ -192,7 +246,7 @@ dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-..."
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DSH_BRIDGE_URL` | `http://127.0.0.1:3080` | 网关地址 |
+| `DSH_BRIDGE_URL` | `http://127.0.0.1:3080` | 网关地址。**必须指向插件实际挂载的那个 profile 的端口**（DSH 客户端里就是 GUI 端口，例如 19387） |
 | `DSH_BRIDGE_WORKSPACE` | `D:\Harness` | 网关默认共享工作目录 |
 | `DSH_BRIDGE_ROOT` | `D:\Harness` | `dsh_read_file` 相对路径基准 |
 | `DSH_BRIDGE_HISTORY` | 多级降级 | 协作历史文件位置（默认 D 盘 → 用户目录 → 临时目录逐级降级） |
@@ -211,11 +265,25 @@ dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-..."
 - **评审不支持会话目标**：评审员必须与编码会话隔离，"独立评审"才成立
 - session 目标不使用 `cwd`/`lane`/`model`/`--commit`（会话自带这些语义），传了会被判 `invalid-target`
 - 网关重启会丢失内存中的任务表（含 session 观察器），这是既有设计
+- **替换包内容不会热重载**：升级后必须重启 profile 进程，否则跑的还是旧 JS 模块（HMR 只重挂组合，不复用新代码）
+- **组合包被取消选中 = 插件完全不挂载**：此时所有 `/api/dsh-bridge/*` 都落到网关鉴权层返回 401（不是 404，容易误判成没装）
 - **DSH profile 的 pnpm 供应链冷却**：新发布的版本约 24 小时内会被 `minimumReleaseAge` 拒绝安装（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`）；管理器会把它写进 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 才放行。刚发版就装不上属正常，不是包的问题
-- 升级已装组合包 = **卸载 → 重新安装**；卸载会把该包从 `dsh.profile.bundles` 移除，所以重装后**要确认它被重新选中**，否则插件不会挂载（表现为所有 `/api/dsh-bridge/*` 都落到网关鉴权层返回 401）
+- 升级已装组合包：客户端插件页没有升级入口，官方姿势是**卸载 → 重装**；但卸载会把该包从 `dsh.profile.bundles` 移除，重装后**要确认它被重新选中**，否则插件不会挂载（表现为所有 `/api/dsh-bridge/*` 都落到网关鉴权层返回 401）。更省事的做法是直接 `dsh plugin add <包>@<版本>`，见上文「升级到新版本」
 - Codex Desktop Windows 本地市场技能注入 bug（见上，MCP 通道不受影响）
 - 动态插件环境无 `AbortSignal`，冷恢复失败时自动降级为一次性执行；宿主组合持久化版无此问题
 - ChatGPT Plus 写入型 MCP 的开放度取决于 OpenAI 产品策略
+
+## 开发与测试
+
+```sh
+node test/session-target.test.mjs      # 纯函数：目标判定 / 候选挑选 / 错误映射 / 基线切分 / 汇报选文
+node test/dsh-bridge.test.mjs          # 路由级：假 DSH 运行时 + 桩 peer，加载真实 bridge 跑真实路由
+node --test test/*.test.mjs            # 两个一起跑（CI 用的是这条）
+```
+
+- 路由级测试会断言 **worker 分支确实调用了 `startContinuable`**、**session 分支只调用 `prompt` 且不建 owner/子代理**——这类"参数遮蔽/串线"缺陷只有在这一层才抓得到（v0.1.2~0.1.4 的 `deliver` 遮蔽 bug 就是它抓回来的）。
+- CI（`.github/workflows/publish.yml`）每次 tag 都跑：语法检查 → 单测 → 包契约 → 版本号三处一致 → tarball 清单 → 干净目录安装 + CLI/MCP 冒烟 → 6 工具握手断言 → bridge 导出契约。**任何一步失败都不会发布**。
+- 发布：`package.json` / `.codex-plugin/plugin.json` / `mcp/dsh-mcp.mjs` 的 `SERVER_VERSION` 三处同步改版本 → commit → 打 tag `vX.Y.Z` → 推 tag，CI 自动带 provenance 发布。
 
 ## License
 
