@@ -11,6 +11,7 @@ import {
   assistantTextOf,
   baselineOf,
   extractNewAssistantText,
+  pickSessionResult,
   classifyTarget,
   selectSession,
   mapControllerError,
@@ -203,4 +204,14 @@ test('looksLikeDisabledSearch: 只认"search is disabled"，不吞其他错误',
   assert.equal(looksLikeDisabledSearch(new Error('network down')), false)
   assert.equal(looksLikeDisabledSearch(undefined), false)
   assert.equal(looksLikeDisabledSearch({ message: 'search is disabled' }), true)
+})
+
+test('pickSessionResult: 以重读的整轮文本为准，绝不与流式累计相加', () => {
+  // 相加会让汇报重复两遍——v0.1.4 在真实会话上就是这样。
+  assert.equal(pickSessionResult('流式半份', '完整一轮'), '完整一轮')
+  assert.equal(pickSessionResult('流式文本', ''), '流式文本')
+  assert.equal(pickSessionResult('  流式  ', '   '), '流式')
+  assert.equal(pickSessionResult(undefined, '只有重读'), '只有重读')
+  assert.equal(pickSessionResult('', ''), '(无输出)')
+  assert.equal(pickSessionResult(undefined, undefined), '(无输出)')
 })

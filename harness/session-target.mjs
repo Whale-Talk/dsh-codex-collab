@@ -78,6 +78,20 @@ export const extractNewAssistantText = (events, baseline) => {
 }
 
 /**
+ * 收尾时选哪一份文本作为汇报。
+ *
+ * 以"派发后重读持久日志"得到的整轮文本为准——它是流式累计的超集；只有重读失败
+ * 或结果为空时，才退回 follow 累计的那份。**绝不能把两者相加**：那会让汇报重复
+ * 两遍（v0.1.4 的真实缺陷，在真实会话上实测出现）。
+ */
+export const pickSessionResult = (streamed, extracted) => {
+  const fromLog = typeof extracted === 'string' ? extracted.trim() : ''
+  if (fromLog !== '') return fromLog
+  const fromStream = typeof streamed === 'string' ? streamed.trim() : ''
+  return fromStream !== '' ? fromStream : '(无输出)'
+}
+
+/**
  * 判定一次派发的目标。
  *
  * 接受两种书写：显式 `target` 对象（HTTP/原生工具），或扁平的 `sessionId`/`sessionQuery`

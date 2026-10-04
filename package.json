@@ -1,6 +1,6 @@
 {
   "name": "@whaletalk/dsh-codex-collab",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Codex × DeepSeek Harness 双向编码协作：Codex 主导派活与验收，DeepSeek Harness 编码子代理在共享工作目录执行并回传，独立评审子代理实际跑通构建/测试后出具报告。提供 DSH 宿主网关插件、零依赖 MCP 服务器与 Codex 技能三件套。",
   "license": "MIT",
   "type": "module",

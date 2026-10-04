@@ -26,6 +26,7 @@ import {
   assistantTextOf,
   baselineOf,
   extractNewAssistantText,
+  pickSessionResult,
   classifyTarget,
   selectSession,
   mapControllerError,
@@ -505,19 +506,20 @@ export async function apply(ctx) {
   const finishSessionTask = (record, stopReason) => {
     if (record.settled) return
     void (async () => {
-      let text = record.total
+      let extractedText = ''
       if (sessionQuery !== undefined) {
         try {
           const snap = await sessionQuery.readSession(record.sessionId)
           const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
           const extracted = extractNewAssistantText(events, record.baseline)
           record.baseline = extracted.baseline
-          if (extracted.text.trim() !== '') text = record.total + extracted.text
+          extractedText = extracted.text
         } catch (e) {
           console.error('[dsh-bridge] session result read failed:', errText(e).slice(0, 200))
         }
       }
-      settleSessionTask(record, 'done', { result: text.trim() !== '' ? text.trim() : '(无输出)', stopReason })
+      // 重读的整轮文本优先；流式累计只在重读失败时兜底——两者相加会重复两遍。
+      settleSessionTask(record, 'done', { result: pickSessionResult(record.total, extractedText), stopReason })
     })()
   }
 
