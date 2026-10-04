@@ -637,13 +637,13 @@ export async function apply(ctx) {
     return { task, failed: null }
   }
 
-  const enqueue = async (instruction, incomingHistory, target, modelAlias, kind, deliver, notes) => {
+  const enqueue = async (instruction, incomingHistory, target, modelAlias, kind, deliveryMode, notes) => {
     if (incomingHistory !== undefined) syncHistory(incomingHistory)
     if (target !== undefined && target.kind === 'session') {
       // session 目标：不注册工作区、不建 owner、不建子代理，失败也不降级为新建。
       const dispatched = await dispatchToSession(
         instruction, target,
-        deliver === undefined ? 'queue' : deliver,
+        deliveryMode === undefined ? 'queue' : deliveryMode,
         Array.isArray(notes) ? notes : [],
         incomingHistory,
       )
