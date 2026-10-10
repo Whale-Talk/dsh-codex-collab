@@ -1,0 +1,12 @@
+{
+  "name": "dsh-codex-mcp-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "把 Codex CLI 当作 MCP 服务端挂进 DeepSeek Harness：DSH 侧 agent 获得 mcp__codex__* 工具，可反向调用 Codex。",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,48 @@
+# 反向通道：把 Codex 挂成 DSH 的一个 MCP 服务端。
+#
+# 谁提供什么：
+#   - DSH 侧：@deepseek-ai/dsh-mcp-client（harness 自带）——连外部 MCP 服务器，
+#     并把它们的工具以 mcp__<serverName>__<tool> 注册进 ctx.tools。
+#   - Codex 侧：codex mcp-server（stdio）——把 Codex 暴露成 MCP 服务端。
+#
+# 用法（二选一）：
+#   A) 把下面这行 insert 追加到你的 profile cordis.patch.yml 数组末尾；
+#   B) 把本目录当作一个 bundle 安装（路径写绝对路径）：
+#        dsh plugin --profile <profile> add <本目录绝对路径>
+#
+# 装完必须**重启 profile 进程**：新增组合包不会热挂载，只有重启后工具才会出现。
+# 之后在 DSH 侧的工具列表里找 mcp__codex__*（例如 mcp__codex__codex）。
+- insert:
+    - id: codex-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: codex
+        transport: stdio
+
+        # ---- Windows（最常见的坑）----
+        # npm 装的 codex 是 .cmd 垫片，而 DSH 的 stdio transport 直接 spawn
+        # （不经 shell），spawn 一个 .cmd 在 Windows 上会 EINVAL。
+        # 所以用 node 跑垫片背后的 JS；把 <you> 换成你的用户名。
+        command: node
+        args:
+          - 'C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js'
+          - 'mcp-server'
+
+        # 更稳的写法（绕开 PATH 与垫片，直接指向平台二进制；路径随版本略有不同）：
+        #   command: 'C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+        #   args: ['mcp-server']
+
+        # ---- macOS / Linux ----
+        # 垫片本身是可执行文件，直接写命令名即可：
+        #   command: codex
+        #   args: ['mcp-server']
+
+        # 远端 Codex（有人把 mcp-server 包成 HTTP 时）用：
+        #   transport: streamable-http
+        #   url: http://127.0.0.1:3000/mcp
+        #   headers: { Authorization: 'Bearer ...' }
+
+        # 启动失败不拖垮 harness：插件仍激活，只是不注册这批工具，日志里有原因。
+        failOnStartupError: false
+        # Codex 一轮可能跑很久（要读完仓库再答），给足超时；默认只有 60s。
+        toolCallTimeoutMs: 600000

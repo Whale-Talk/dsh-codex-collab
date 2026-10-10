@@ -23,6 +23,7 @@
     "harness/",
     "mcp/",
     "codex-plugin/",
+    "templates/",
     "cordis.patch.yml",
     "README.md",
     "LICENSE",

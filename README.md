@@ -64,6 +64,7 @@ flowchart LR
 | `harness/dsh-bridge.mjs` | DeepSeek Harness 宿主组合网关插件 | 提供 HTTP 网关（`/api/dsh-bridge/*`）、WS 推送、原生工具；管理编码/评审子代理，并把任务投递进已有会话。**必须装进 harness 宿主组合**（见下文） |
 | `harness/session-target.mjs` | 会话目标的纯决策层 | 目标判定、候选挑选（0/1/N 不猜）、RemoteError→稳定 reason、基线切分、汇报选文。无 DSH import，可单测；`dsh-bridge.mjs` 依赖它，**两个文件必须一起部署** |
 | `test/` | 25 项 Node 测试 | `session-target` 纯函数单测 + `dsh-bridge` 路由级回归测试（假 DSH 运行时加载真实 bridge）。CI 每次都跑 |
+| `templates/codex-mcp/` | 反向通道配置模板 | 把 Codex CLI 当 MCP 服务端挂进 DSH（得到 `mcp__codex__*` 工具），让 DSH 侧也能调用 Codex。见下文「反向通道」 |
 | `cordis.patch.yml` | bundle patch | 把网关插件挂进 DSH 宿主组合；`dsh.bundle.patch` 指向它，所以 `dsh plugin add` 能自动 reconcile |
 
 ## 功能
@@ -241,6 +242,54 @@ dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-…"
 `matchedBy` 说明"找到"走了哪条路：`search` = 会话搜索索引；`list` = 索引被部署禁用时退回遍历列表 + 标题投影（都不激活 Agent）。
 
 失败一律返回稳定 `reason` 且**不创建任何会话/工作区**：`session-query-empty`（没命中）、`session-ambiguous`（多条命中，附 `candidates`）、`session-not-found`、`session-busy`、`session-writer-held`（会话被别的写入方占用）、`session-archived`、`session-not-accepted`、`session-timeout`、`session-cancel-refused`（取消会话目标默认被拒，需 `--force`）。
+
+## 反向通道：让 DSH 调用 Codex
+
+上面的链路都是 **Codex → DSH**。反过来的 **DSH → Codex** 也能做，但要分清两种含义：
+
+| 含义 | 可行性 |
+|---|---|
+| 让 DSH 调用 Codex（把 Codex 当执行器/评审员） | ✅ 两端原生支持，见下 |
+| 让 DSH 往你**正开着的某条 ChatGPT/Codex 对话**里插一条消息、就地开一轮 | ❌ 做不到 |
+
+第二种做不到的原因：现有链路是 Codex 主动（它启动 `dsh-mcp` 子进程调工具），而 MCP 是
+**客户端发起**的协议——服务端无法命令客户端开一轮。服务端→客户端只有 `notifications/*`
+（纯通知，不触发回合）、`sampling/createMessage`、`elicitation/create`（取决于客户端是否
+实现，且不等于"在对话里跑工具"）；ChatGPT 侧同样没有公开 API 能向用户会话投消息。
+
+### 方案 A：把 Codex 挂成 DSH 的 MCP 服务（推荐）
+
+现成模板见 [`templates/codex-mcp/`](templates/codex-mcp/README.md)，原理是两端各有一个原生件：
+
+- DSH 侧 `@deepseek-ai/dsh-mcp-client`（harness 自带）：连外部 MCP 服务器，并把工具以 `mcp__<serverName>__<tool>` 注册进 `ctx.tools`；
+- Codex 侧 `codex mcp-server`（stdio）：把 Codex 暴露成 MCP 服务端。
+
+```yaml
+- insert:
+    - id: codex-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: codex
+        transport: stdio
+        command: node
+        args: ['C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js', 'mcp-server']
+        failOnStartupError: false
+        toolCallTimeoutMs: 600000
+```
+
+- **Windows 必读**：npm 装的 `codex` 是 `.cmd` 垫片，而 DSH 的 stdio 是**直接 spawn**（不经 shell），spawn `.cmd` 会 `EINVAL`——所以用 `node` 跑垫片背后的 `bin/codex.js`，或直接指向 `...\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe`。macOS/Linux 直接 `command: codex`。
+- `toolCallTimeoutMs` 默认只有 60s，Codex 跑一轮常常不够，模板给了 600000。
+- 装完需**重启 profile 进程**；连接失败不会拖垮 harness，只是这批工具不出现（日志里有原因）。
+
+### 方案 B：worker 里直接跑 `codex exec`
+
+```powershell
+codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
+```
+
+一次性、零协议改动；代价是每次都是新会话（无跨轮记忆），且需要执行 shell 的权限。
+
+> 注意：插件自带的 `dsh_collab_send` / `dsh_collab_review` 是 **DSH 侧入口**，只回到同一个网关，**不经过 Codex**。要"叫 Codex 干活"用上面 A/B；要"让 Codex 那条对话继续"，只能等 Codex 自己下一轮（`dsh_task --wait` 或 `dsh_task_status`）。
 
 ## 环境变量
 
