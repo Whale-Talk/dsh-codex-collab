@@ -218,8 +218,9 @@ dsh_task({ "instruction": "继续推进第 3 步…", "sessionId": "session-8d48
 # 新建子代理（默认行为）
 dsh-task --in "<指令>" --cwd "<目录>" [--lane backend] [--model fast|pro] [--commit]
 
-# 接进已有会话：先找，再派
+# 接进已有会话：先找（或先空跑验证），再派
 dsh-task --sessions "<标题关键词>"                    # 只读列候选，拿 sessionId
+dsh-task --dry-run --find "<标题关键词>"               # 只解析目标、回显命中，不投递任何消息
 dsh-task --in "<指令>" --session "<sessionId>" [--steer]
 dsh-task --in "<指令>" --find "<标题关键词>"           # 唯一命中才派；否则退出码 4
 
@@ -235,13 +236,21 @@ dsh-task --sessions "按文档启动OKX策略实验计划"
 # → {"items":[{"sessionId":"session-8d481ad9-…","snippet":"按文档启动OKX策略实验计划",
 #              "agentAvailable":true}],"total":1,"matchedBy":"list"}
 
+# 1b) 没命中时会给近似候选（按标题相似度 + 最近更新排序），换词重查或改用 sessionId——
+#     绝不要发一条消息去"试探命中"（它会落进对方会话并跑成回合，污染对话）
+dsh-task --dry-run --find "量化框架"
+# → {"resolved":false,"reason":"session-query-empty",
+#    "candidates":[{"sessionId":"1c0f99f8-…","snippet":"你是一个量化研究项目的技术","score":0.333}, …]}
+
 # 2) 接通（投递进那条会话；这一轮的助手回复作为汇报返回，只回报本轮新增文本）
 dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-…"
 ```
 
 `matchedBy` 说明"找到"走了哪条路：`search` = 会话搜索索引；`list` = 索引被部署禁用时退回遍历列表 + 标题投影（都不激活 Agent）。
 
-失败一律返回稳定 `reason` 且**不创建任何会话/工作区**：`session-query-empty`（没命中）、`session-ambiguous`（多条命中，附 `candidates`）、`session-not-found`、`session-busy`、`session-writer-held`（会话被别的写入方占用）、`session-archived`、`session-not-accepted`、`session-timeout`、`session-cancel-refused`（取消会话目标默认被拒，需 `--force`）。
+**`delivered` 与排队语义**（重要）：`prompt` 一旦被目标会话接受，就表示消息**已经进了它的队列**，响应里会带 `delivered: true`；此后即便我们的观察超时（会话可能正跑一个很长的回合），也**不要重发**——重发会让同一份内容在用户会话里出现两次。`queue` 模式不再用 120s 判失败：没在 120s 内开跑只记一条 note 并继续等，最终由总预算（默认 1h）收口为 `session-timeout` + `delivered: true`。
+
+失败返回稳定 `reason` 且**不创建任何会话/工作区**：`session-query-empty`（没命中，附 `candidates`）、`session-ambiguous`（多条命中，附 `candidates`）、`session-not-found`、`session-busy`、`session-writer-held`（会话被别的写入方占用）、`session-archived`、`session-not-accepted`（仅当 prompt **未被接受**）、`session-timeout`、`session-cancel-refused`（取消会话目标默认被拒，需 `--force`）。
 
 ## 反向通道：让 DSH 调用 Codex
 

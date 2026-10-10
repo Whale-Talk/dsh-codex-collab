@@ -41,6 +41,7 @@ function parseArgs(argv) {
     else if (a === '--session') { out.sessionId = argv[++i] || '' }
     else if (a === '--find') { out.find = argv[++i] || '' }
     else if (a === '--steer') { out.steer = true }
+    else if (a === '--dry-run') { out.dryRun = true }
     else if (a === '--force') { out.force = true }
     else { rest.push(a) }
   }
@@ -175,22 +176,53 @@ async function main() {
     }
     console.log(JSON.stringify(res.json, null, 2))
     const items = Array.isArray(res.json.items) ? res.json.items : []
+    if (items.length === 0 && Array.isArray(res.json.candidates) && res.json.candidates.length > 0) {
+      console.error('未命中。候选（改用 --session <id>，或换个关键词）:')
+      for (const c of res.json.candidates) console.error('  ' + c.sessionId + '  ' + c.snippet + (c.score === undefined ? '' : '  score=' + c.score))
+      console.error('提示: 验证命中用 --dry-run，不要投递消息去试探。')
+    }
     finish(items.length > 0 ? 0 : 4)
   }
 
   const instruction = opts.instruction.trim()
-  if (!instruction) {
-    console.error('用法: node task.mjs --in "<指令>" [--cwd 目录] [--lane 名] [--model fast|pro] [--commit] [--timeout 秒] [--no-wait]')
-    console.error('      node task.mjs --in "<指令>" (--session <会话id> | --find "<标题关键词>") [--steer]   # 投递进已有会话')
-    console.error('查找: node task.mjs --sessions "<标题关键词>"   # 只读列出候选, 拿 sessionId 再派活')
-    console.error('管理: node task.mjs --list | --status <taskId> | --cancel <taskId> [--force]')
-    console.error('退出码: 0 成功 / 1 失败 / 2 用法 / 3 超时 / 4 会话未命中或不唯一 / 5 session 目标取消被拒')
-    finish(2)
-  }
   const cwd = (opts.cwd || process.env.DSH_BRIDGE_CWD || '').trim()
   const sessionId = (opts.sessionId || '').trim()
   const find = (opts.find || '').trim()
   const sessionTarget = sessionId !== '' ? { sessionId } : (find !== '' ? { sessionQuery: find } : null)
+
+  // --dry-run：只解析目标、回显命中结果，什么都不投递。验证"这条查询会命中哪条会话"就用它，
+  // 绝不要投递一条消息去试探（那会落进用户会话并跑成回合，污染对话）。
+  if (opts.dryRun) {
+    if (instruction === '' && sessionTarget === null && cwd === '') {
+      console.error('用法: node task.mjs --dry-run (--find "<标题关键词>" | --session <会话id> | --cwd <目录>)')
+      finish(2)
+    }
+    const res = await request('POST', GATEWAY + '/api/dsh-bridge/task', {
+      instruction: instruction === '' ? '(dry-run)' : instruction,
+      dryRun: true,
+      ...(sessionTarget === null ? (cwd ? { cwd } : {}) : sessionTarget),
+    })
+    console.log(JSON.stringify(res.json, null, 2))
+    if (res.json === null || typeof res.json !== 'object') finish(1)
+    if (res.json.resolved !== true) {
+      if (Array.isArray(res.json.candidates) && res.json.candidates.length > 0) {
+        console.error('未命中。候选（改用 --session <id>，或换个关键词）:')
+        for (const c of res.json.candidates) console.error('  ' + c.sessionId + '  ' + c.snippet + (c.score === undefined ? '' : '  score=' + c.score))
+      }
+      finish(4)
+    }
+    finish(0)
+  }
+
+  if (!instruction) {
+    console.error('用法: node task.mjs --in "<指令>" [--cwd 目录] [--lane 名] [--model fast|pro] [--commit] [--timeout 秒] [--no-wait]')
+    console.error('      node task.mjs --in "<指令>" (--session <会话id> | --find "<标题关键词>") [--steer]   # 投递进已有会话')
+    console.error('查找: node task.mjs --sessions "<标题关键词>"   # 只读列出候选, 拿 sessionId 再派活')
+    console.error('      node task.mjs --dry-run (--find "<关键词>" | --session <id>)   # 只解析目标, 不投递（验证命中用这个）')
+    console.error('管理: node task.mjs --list | --status <taskId> | --cancel <taskId> [--force]')
+    console.error('退出码: 0 成功 / 1 失败 / 2 用法 / 3 超时 / 4 会话未命中或不唯一 / 5 session 目标取消被拒')
+    finish(2)
+  }
   if (sessionTarget !== null && (cwd !== '' || opts.commit)) {
     console.error('task.mjs: --session/--find 不能与 --cwd/--commit 同时使用（已有会话自带工作目录，本工具不替它提交）')
     finish(2)
@@ -246,6 +278,11 @@ async function main() {
       console.log(JSON.stringify({ phase: 'finished', ...status }))
       console.log('=== DeepSeek 汇报 ===')
       console.log(status.result || status.error || '(无内容)')
+      // delivered=true 表示 prompt 已被那条会话接受（进了它的队列）：即便我们等超时了，
+      // 消息也可能会跑，**不要重发**（重发会让同一份内容在用户会话里出现两次）。
+      if (status.status === 'error' && status.delivered === true) {
+        console.error('注意: 消息已投递进该会话的队列（delivered=true），只是我们没等到它开跑。不要重发；可用 --status ' + task.taskId + ' 继续观察。')
+      }
       if (status.status === 'done') {
         // session 目标的记忆就在那条会话里，不再往协作历史里塞一份。
         if (sessionTarget === null) {

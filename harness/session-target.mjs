@@ -232,6 +232,54 @@ export const looksLikeDisabledSearch = (error) => {
   return /search is disabled/i.test(text)
 }
 
+/** 去空白后的字符 bigram 集合（CJK 友好：不需要分词）。 */
+const bigramsOf = (value) => {
+  const text = typeof value === 'string' ? value.replace(/\s+/g, '') : ''
+  const out = new Set()
+  if (text.length === 1) out.add(text)
+  for (let i = 0; i + 1 < text.length; i++) out.add(text.slice(i, i + 2))
+  return out
+}
+
+/** 查询里的 bigram 有多少比例出现在标题里（0..1）。 */
+export const titleSimilarity = (query, title) => {
+  const q = bigramsOf(query)
+  const t = bigramsOf(title)
+  if (q.size === 0 || t.size === 0) return 0
+  let shared = 0
+  for (const gram of q) if (t.has(gram)) shared++
+  return shared / q.size
+}
+
+/**
+ * `session-query-empty` 时给出的"近似候选"。
+ *
+ * 起因是一个真实事故：调用方搜「量化框架」没命中，又**没有别的办法确认标题**，于是
+ * 发了一条占位消息去"探测命中"——那条消息落进了用户自己的会话并跑成回合，污染了
+ * 对话。修法是不给"探测"留动机：查询落空时直接回一批候选标题（同 bigram 相似度排
+ * 序，无相似度的按最近更新补位），调用方靠只读信息就能改词重查。
+ */
+export const rankTitleCandidates = (query, summaries, limit = 5) => {
+  const list = Array.isArray(summaries) ? summaries : []
+  const scored = []
+  for (const summary of list) {
+    if (summary === null || typeof summary !== 'object') continue
+    if (typeof summary.sessionId !== 'string' || summary.sessionId === '') continue
+    const title = typeof summary.title === 'string' && summary.title !== '' ? summary.title : ''
+    const updatedAt = typeof summary.updatedAt === 'number' ? summary.updatedAt : 0
+    scored.push({ sessionId: summary.sessionId, snippet: title, score: titleSimilarity(query, title), updatedAt })
+  }
+  const byRecency = (a, b) => b.updatedAt - a.updatedAt
+  const related = scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score || byRecency(a, b))
+  const rest = scored.filter((s) => s.score === 0).sort(byRecency)
+  const bound = Math.max(1, Math.min(Number(limit) || 5, MAX_CANDIDATES))
+  return [...related, ...rest].slice(0, bound).map((s) => ({
+    sessionId: s.sessionId,
+    snippet: s.snippet,
+    score: Math.round(s.score * 1000) / 1000,
+  }))
+}
+
 /** 任务在 HTTP 行上的回显：调用方一眼能看出这次是"新建"还是"接进哪个会话"。 */
 export const taskResponse = (task) => {
   const out = { taskId: task.taskId, status: task.status, kind: task.kind }
@@ -246,5 +294,10 @@ export const taskResponse = (task) => {
     out.target = { kind: 'worker', cwd: target.cwd, lane: target.lane }
   }
   if (Array.isArray(task.notes) && task.notes.length > 0) out.notes = task.notes
+  // delivered=true：prompt 已被目标会话接受（进了它的队列）。调用方据此知道
+  // "别重发"——即便随后我们的观察超时并报错，消息也可能正在队列里等着跑。
+  if (task.target !== undefined && task.target !== null && task.target.kind === 'session' && task.delivered === true) {
+    out.delivered = true
+  }
   return out
 }

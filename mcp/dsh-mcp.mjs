@@ -6,7 +6,7 @@
 //      客户端（Secure MCP Tunnel / cloudflared）桥接给 ChatGPT 等远程产品。
 const GATEWAY = process.env.DSH_BRIDGE_URL || 'http://127.0.0.1:3080'
 const SERVER_NAME = 'dsh-bridge'
-const SERVER_VERSION = '0.1.6'
+const SERVER_VERSION = '0.1.7'
 const PROTOCOL_VERSION = '2024-11-05'
 
 const log = (...args) => console.error('[dsh-mcp]', ...args)
@@ -20,17 +20,20 @@ const tools = [
       '参数: instruction(必填,完整中文指令:目标/产出目录/验收标准/约束), cwd(工作目录,默认 D:\\Harness,通常传当前项目目录), ' +
       'lane(并行通道名,默认 main), model(fast=deepseek-v4-flash 快而省 / pro=deepseek-v4-pro 质量优先), ' +
       'sessionId(已有会话 id), sessionQuery(按标题/内容搜已有会话,需唯一命中,否则返回候选), deliver(queue=排队(默认) / steer=插入当前回合), ' +
-      'wait(默认 true,阻塞至任务完成并返回 DeepSeek 汇报), timeoutSec(默认 600,最长 900)。',
+      'dryRun(true 时只解析目标并回显, 不投递任何消息), ' +
+      'wait(默认 true,阻塞至任务完成并返回 DeepSeek 汇报), timeoutSec(默认 600,最长 900)。' +
+      '注意: 验证"这条查询会命中哪条会话"必须用 dryRun 或 dsh_sessions——**绝不要投递一条消息去试探**（那会污染用户会话）。',
     inputSchema: {
       type: 'object',
       properties: {
-        instruction: { type: 'string', description: '完整中文编码指令（目标、产出目录、验收标准、约束）。' },
+        instruction: { type: 'string', description: '完整中文编码指令（目标、产出目录、验收标准、约束）。dryRun 时可省略。' },
         cwd: { type: 'string', description: '工作目录（绝对路径）。默认 D:\\Harness。与 sessionId/sessionQuery 互斥。' },
         lane: { type: 'string', description: '并行通道名（默认 main）。' },
         model: { type: 'string', enum: ['fast', 'pro'], description: '模型别名：fast=deepseek-v4-flash，pro=deepseek-v4-pro。' },
         sessionId: { type: 'string', description: '已有会话 id：把指令投递进这条会话，而不是新建子代理。' },
-        sessionQuery: { type: 'string', description: '按标题或内容搜索已有会话；唯一命中才派发，多条会返回 candidates 让你改用 sessionId。' },
+        sessionQuery: { type: 'string', description: '按标题或内容搜索已有会话；唯一命中才派发，多条或落空会返回 candidates 让你改用 sessionId。' },
         deliver: { type: 'string', enum: ['queue', 'steer'], description: '投递方式：queue 排队（默认），steer 插入当前回合。' },
+        dryRun: { type: 'boolean', description: '只解析目标并回显（含命中路径 matchedBy 与候选），不投递任何消息。用来确认命中，替代"发消息探测"。' },
         wait: { type: 'boolean', description: '默认 true：阻塞直到任务完成并返回汇报。' },
         timeoutSec: { type: 'number', description: '最长等待秒数（默认 600，最大 900）。' },
       },
@@ -138,12 +141,19 @@ async function handleToolCall(name, args) {
       sessionId: args.sessionId,
       sessionQuery: args.sessionQuery,
       deliver: args.deliver,
+      dryRun: args.dryRun === true,
     })
+    // dryRun 只解析目标，不产生任务：原样回显给你看命中结果。
+    if (args.dryRun === true) return { ok: task.resolved === true, phase: 'dry-run', ...task }
     // 4xx 拒绝（缺目标 / 会话不存在 / 搜索结果不唯一 / 被写锁占用）不带 taskId，绝不静默新建。
     if (task.taskId === undefined) return { ok: false, phase: 'rejected', ...task }
     if (task.status === 'error') return { ok: false, ...task }
     if (args.wait === false) return { ok: true, phase: 'submitted', ...task }
     const done = await waitTask(task.taskId, args.timeoutSec || 600)
+    // 会话目标报错但 delivered=true：消息已在目标会话队列里，不要重发。
+    if (done.delivered === true && done.status === 'error') {
+      return { ok: false, phase: 'queued-then-failed', resend: false, ...done }
+    }
     return { ok: done.status === 'done', phase: 'finished', ...done }
   }
   if (name === 'dsh_sessions') {

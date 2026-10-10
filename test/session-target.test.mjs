@@ -17,6 +17,8 @@ import {
   mapControllerError,
   sessionTitleOf,
   looksLikeDisabledSearch,
+  titleSimilarity,
+  rankTitleCandidates,
   taskResponse,
 } from '../harness/session-target.mjs'
 
@@ -214,4 +216,42 @@ test('pickSessionResult: 以重读的整轮文本为准，绝不与流式累计�
   assert.equal(pickSessionResult(undefined, '只有重读'), '只有重读')
   assert.equal(pickSessionResult('', ''), '(无输出)')
   assert.equal(pickSessionResult(undefined, undefined), '(无输出)')
+})
+
+// --------------------------------- 查询落空时的近似候选（禁止"用消息探测"）
+test('titleSimilarity: 字符 bigram 覆盖率，中文不需要分词', () => {
+  // 「量化框架」的 bigram = {量化, 化框, 框架}；标题里只命中「量化」→ 1/3
+  assert.equal(titleSimilarity('量化框架', '你是一个量化研究项目的技术'), 1 / 3)
+  assert.equal(titleSimilarity('量化框架', '按文档启动OKX策略实验计划'), 0)
+  assert.equal(titleSimilarity('', '随便什么'), 0)
+  assert.equal(titleSimilarity('单', '单'), 1)
+})
+
+test('rankTitleCandidates: 相似者优先、其余按最近更新补位', () => {
+  const ranked = rankTitleCandidates('量化框架', [
+    { sessionId: 'okx', title: '按文档启动OKX策略实验计划', updatedAt: 200 },
+    { sessionId: 'quant', title: '你是一个量化研究项目的技术', updatedAt: 100 },
+  ])
+  assert.equal(ranked[0].sessionId, 'quant')
+  assert.equal(ranked[0].score, 0.333)
+  assert.equal(ranked.length, 2)
+
+  // 完全不相似时也不能空手：按最近更新给（调用方至少能看到"最近有哪些会话"）
+  const recent = rankTitleCandidates('不相干的词', [
+    { sessionId: 'old', title: 'aaaa', updatedAt: 1 },
+    { sessionId: 'new', title: 'bbbb', updatedAt: 9 },
+  ])
+  assert.deepEqual(recent.map((x) => x.sessionId), ['new', 'old'])
+  assert.equal(recent[0].score, 0)
+
+  // limit 生效；缺标题/脏数据不炸
+  assert.equal(rankTitleCandidates('x', [{ sessionId: 'a', title: '' }, { sessionId: 'b' }, null], 1).length, 1)
+  assert.deepEqual(rankTitleCandidates(null, null), [])
+})
+
+test('taskResponse: session 目标在 delivered 时明确回显，免得调用方重发', () => {
+  const delivered = taskResponse({ taskId: 't', status: 'running', kind: 'task', deliver: 'queue', target: { kind: 'session', sessionId: 's' }, delivered: true })
+  assert.equal(delivered.delivered, true)
+  const worker = taskResponse({ taskId: 't', status: 'accepted', kind: 'task', cwd: 'E:/p', lane: 'main', delivered: true })
+  assert.equal(worker.delivered, undefined)
 })

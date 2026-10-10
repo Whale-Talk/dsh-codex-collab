@@ -32,6 +32,7 @@ import {
   mapControllerError,
   sessionTitleOf,
   looksLikeDisabledSearch,
+  rankTitleCandidates,
   taskResponse,
 } from './session-target.mjs'
 
@@ -449,6 +450,33 @@ export async function apply(ctx) {
     }
   }
 
+  /**
+   * 查询没命中时给的"近似候选"：读 list（不激活 Agent、不开索引），按 bigram 相似度
+   * 与最近更新排序。存在的意义是**不给"探测"留动机**——真实事故里调用方搜不到标题后
+   * 发了一条占位消息去试探，那条消息落进用户会话并跑成回合。有了候选，只读就能改词重查。
+   */
+  const sessionNearMisses = async (query, limit = 5) => {
+    const controller = sessionControllerNow()
+    if (controller === undefined) return []
+    try {
+      const value = await controller.list({}, signalOf())
+      const items = value !== undefined && value !== null && Array.isArray(value.items) ? value.items : []
+      const summaries = []
+      for (const summary of items) {
+        if (summary === null || typeof summary !== 'object' || typeof summary.sessionId !== 'string') continue
+        summaries.push({
+          sessionId: summary.sessionId,
+          title: sessionTitleOf(summary),
+          updatedAt: typeof summary.updatedAt === 'number' ? summary.updatedAt : 0,
+        })
+      }
+      return rankTitleCandidates(query, summaries, limit)
+    } catch (e) {
+      console.error('[dsh-bridge] near-miss lookup failed:', errText(e).slice(0, 200))
+      return []
+    }
+  }
+
   /** 只读解析：query → search 选一；sessionId → 直接用。任何不确定性都返回 reason。 */
   const resolveSessionTarget = async (target) => {
     const controller = sessionControllerNow()
@@ -467,7 +495,13 @@ export async function apply(ctx) {
       }
     }
     const picked = selectSession(hits, target)
-    if (!picked.ok) return picked
+    if (!picked.ok) {
+      // 查询落空不是"死路"：附上近似候选，调用方只读就能改词重查（别再发消息探测）。
+      if (picked.reason === REASONS.QUERY_EMPTY) {
+        return { ...picked, candidates: await sessionNearMisses(target.query) }
+      }
+      return picked
+    }
     let result
     try {
       result = await controller.resolveAgent(picked.sessionId)
@@ -494,6 +528,7 @@ export async function apply(ctx) {
     if (fields.error !== undefined) task.error = fields.error
     if (fields.reason !== undefined) task.reason = fields.reason
     if (fields.stopReason !== undefined) task.stopReason = fields.stopReason
+    if (fields.delivered !== undefined) task.delivered = fields.delivered
     pushTask(task.taskId, status === 'done' ? 'result' : 'error', {
       ...(task.result === undefined ? {} : { text: task.result }),
       ...(task.error === undefined ? {} : { error: task.error }),
@@ -603,6 +638,8 @@ export async function apply(ctx) {
       sessionId: resolved.sessionId, taskId: task.taskId, deliver, baseline,
       total: '', sawRunning: false, activeSince: Date.now(), startedAt: Date.now(),
       settled: false, abort: undefined, watcher: 'pending',
+      // prompt 被接受 = 消息已进会话队列。此后就不该再把它当"没发出去"（见 sweepSessionTargets）。
+      delivered: false, queuedNoted: false,
     }
     sessionTargets.set(resolved.sessionId, record)
 
@@ -635,7 +672,9 @@ export async function apply(ctx) {
     }
 
     watchSessionTask(record)
-    pushTask(task.taskId, 'task-accepted', { target: { kind: 'session', sessionId: resolved.sessionId }, deliver, cwd: resolved.snippet })
+    record.delivered = true
+    task.delivered = true
+    pushTask(task.taskId, 'task-accepted', { target: { kind: 'session', sessionId: resolved.sessionId }, deliver, cwd: resolved.snippet, delivered: true })
     return { task, failed: null }
   }
 
@@ -770,16 +809,39 @@ export async function apply(ctx) {
           }
         } catch (e) { /* 读不到就下一轮再试 */ }
       }
+      // 派发超时只在"prompt 没被接受"时才算失败。
+      // queue 模式下 prompt 被接受就意味着消息已进队列，会在会话空闲时跑；此时报 error
+      // 是误报——实测会话正跑一个 38 分钟的回合，排队等待远超 120s 完全正常，而误报会
+      // 直接诱导调用方重发（真实事故：同一条汇报被投了两次）。所以这里只记一条 note，
+      // 继续等，由下面的总预算兜底。
       if (!record.sawRunning && now - record.startedAt > SESSION_DISPATCH_TIMEOUT_MS) {
-        settleSessionTask(record, 'error', { error: 'the session never started a turn after the prompt was accepted (it may still be queued)', reason: REASONS.NOT_ACCEPTED })
-        continue
+        if (record.delivered === true) {
+          if (record.queuedNoted !== true) {
+            record.queuedNoted = true
+            pushTask(record.taskId, 'note', {
+              note: 'QUEUED',
+              text: 'prompt 已被接受并进入该会话队列，等它空闲时会跑；不要重发',
+              target: { kind: 'session', sessionId: record.sessionId },
+              delivered: true,
+            })
+          }
+        } else {
+          settleSessionTask(record, 'error', { error: 'the session never accepted the prompt', reason: REASONS.NOT_ACCEPTED, delivered: false })
+          continue
+        }
       }
       if (record.sawRunning && record.activeSince > 0 && now - record.activeSince > SESSION_QUIET_TIMEOUT_MS) {
         finishSessionTask(record, 'quiet-timeout')
         continue
       }
       if (now - record.startedAt > SESSION_TOTAL_TIMEOUT_MS) {
-        settleSessionTask(record, 'error', { error: 'session task exceeded its total budget', reason: REASONS.TIMEOUT })
+        settleSessionTask(record, 'error', {
+          error: record.delivered === true
+            ? 'prompt 已投递进该会话队列，但预算内它始终没有开始这一轮（会话可能一直在忙，或未被激活）；不要重发，可用 status 继续观察'
+            : 'session task exceeded its total budget before the prompt was accepted',
+          reason: REASONS.TIMEOUT,
+          delivered: record.delivered === true,
+        })
       }
     }
   }
@@ -851,14 +913,55 @@ export async function apply(ctx) {
       const parsed = await readJsonBody(req, res)
       if (parsed === null) return
       const instruction = parsed !== null && typeof parsed === 'object' && typeof parsed.instruction === 'string' ? parsed.instruction : ''
-      if (instruction.trim() === '') { sendJson(res, 400, { error: 'missing instruction' }); return }
+      const dryRun = parsed !== null && typeof parsed === 'object' && parsed.dryRun === true
+      if (!dryRun && instruction.trim() === '') { sendJson(res, 400, { error: 'missing instruction' }); return }
       const classified = classifyTarget(parsed)
       if (!classified.ok) { sendJson(res, 400, { error: classified.message, reason: classified.reason }); return }
+      // dryRun：只解析目标、回显它，**不投递任何东西**。存在的意义是让"我这条查询会命中
+      // 哪条会话"能纯只读地问出来——真实事故里调用方就是因为没法先验证，才发了一条占位
+      // 消息去探测，结果污染了用户会话。
+      if (dryRun) {
+        if (classified.target.kind === 'session') {
+          const resolved = await resolveSessionTarget(classified.target)
+          if (!resolved.ok) {
+            sendJson(res, 200, {
+              dryRun: true,
+              resolved: false,
+              reason: resolved.reason,
+              error: resolved.message,
+              ...(Array.isArray(resolved.candidates) && resolved.candidates.length > 0 ? { candidates: resolved.candidates } : {}),
+            })
+            return
+          }
+          sendJson(res, 200, {
+            dryRun: true,
+            resolved: true,
+            wouldDispatch: true,
+            target: { kind: 'session', sessionId: resolved.sessionId, deliver: classified.deliver },
+            ...(resolved.snippet === undefined ? {} : { snippet: resolved.snippet }),
+            ...(resolved.matchedBy === undefined ? {} : { matchedBy: resolved.matchedBy }),
+            ...(resolved.candidates.length > 0 ? { candidates: resolved.candidates } : {}),
+            note: '只解析目标，未投递任何消息',
+          })
+          return
+        }
+        const cwd = normalizeCwd(classified.target.cwd)
+        const lane = normalizeLane(classified.target.lane)
+        sendJson(res, 200, {
+          dryRun: true,
+          resolved: true,
+          wouldDispatch: true,
+          target: { kind: 'worker', cwd, lane },
+          note: '只解析目标，未派活',
+        })
+        return
+      }
       const task = await enqueue(instruction, parsed.history, classified.target, parsed.model, 'task', classified.deliver, classified.notes)
       if (task.status === 'error') {
         sendJson(res, 400, {
           error: task.error,
           reason: task.reason,
+          ...(task.delivered === true ? { delivered: true } : {}),
           ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
         })
         return
@@ -939,7 +1042,18 @@ export async function apply(ctx) {
             }
           }
         }
-        sendJson(res, 200, { items, hasMore: hits.length > items.length, total: hits.length, matchedBy: found.matchedBy })
+        // 没命中不是死路：给近似候选（同一批只读数据，按相似度 + 最近更新排序），
+        // 让调用方改词重查——而不是发一条消息去"探测命中"。
+        const candidates = hits.length === 0 ? await sessionNearMisses(query, limit) : []
+        sendJson(res, 200, {
+          items,
+          hasMore: hits.length > items.length,
+          total: hits.length,
+          matchedBy: found.matchedBy,
+          ...(candidates.length > 0
+            ? { candidates, reason: REASONS.QUERY_EMPTY, note: '标题/目录里都没有这个关键词；candidates 是按相似度与最近更新排的候选，改词重查或直接用 sessionId' }
+            : {}),
+        })
       } catch (e) {
         sendJson(res, 502, { error: errText(e), reason: mapControllerError(e) })
       }
@@ -1042,6 +1156,8 @@ export async function apply(ctx) {
           taskId: task.taskId, status: task.status, kind: task.kind, cwd: task.cwd, lane: task.lane,
           target: task.target, deliver: task.deliver, instruction: task.instruction.slice(0, 300),
           result: task.result, error: task.error, reason: task.reason, fallback: task.fallback,
+          // delivered=true 表示 prompt 已被会话接受（进了队列）——即便后面报错也不要重发。
+          ...(task.delivered === undefined ? {} : { delivered: task.delivered }),
           ...(task.matchedBy === undefined ? {} : { matchedBy: task.matchedBy }),
           ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
           ...(record === undefined ? {} : { watcher: record.watcher, sawRunning: record.sawRunning }),
@@ -1143,24 +1259,48 @@ export async function apply(ctx) {
   // ---- 原生工具（宿主全局工具层）----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'dsh_collab_send',
-    description: '向 Codex 协作频道发送一条编码指令。默认新建编码子代理在指定工作目录执行;给出 sessionId 或 sessionQuery 时改为投递进那一条已有会话(会话自带的对话与上下文)。指令用中文。',
+    description: '向 Codex 协作频道发送一条编码指令。默认新建编码子代理在指定工作目录执行;给出 sessionId 或 sessionQuery 时改为投递进那一条已有会话(会话自带的对话与上下文)。指令用中文。'
+      + '【硬规则】验证"这条查询会命中哪条会话"必须用 dryRun=true(只解析、不投递);**绝不投递任何消息去试探命中**——那会作为一条真实用户消息落进对方会话并跑成回合,污染对话。'
+      + '【硬规则】返回里 delivered=true 表示消息已被那条会话接受(进了它的队列),即便随后观察到超时或错误也**不要重发**,用 wait=false 记下 taskId 再查状态。'
+      + 'sessionQuery 落空时会返回 candidates(按标题相似度 + 最近更新排序),换词重查或改用 sessionId。',
     parameters: {
       instruction: { type: 'string', required: true, description: '要交给编码子代理执行的指令。' },
       cwd: { type: 'string', description: '工作目录(默认 ' + DEFAULT_WORKSPACE + ')。与 sessionId/sessionQuery 互斥。' },
       lane: { type: 'string', description: '并行通道名(默认 main,同目录不同 lane 并行)。' },
       model: { type: 'string', description: '模型别名: default | fast | pro。' },
       sessionId: { type: 'string', description: '已有会话 id:把指令投递进这条会话,而不是新建。' },
-      sessionQuery: { type: 'string', description: '按标题/内容搜索已有会话(唯一命中才生效,多条会返回候选)。' },
+      sessionQuery: { type: 'string', description: '按标题/内容搜索已有会话(唯一命中才生效,多条或落空会返回候选)。' },
       deliver: { type: 'string', description: "投递方式: queue(默认,排队) 或 steer(插入当前回合)。" },
+      dryRun: { type: 'boolean', description: '为 true 时只解析目标并回显(含 matchedBy 与候选),不投递任何消息——验证命中用它。' },
       wait: { type: 'boolean', description: '为 true 时等待结果(最长 15 分钟)。' },
     },
     output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
     async execute(args) {
       const classified = classifyTarget(args)
       if (!classified.ok) return { ok: false, reason: classified.reason, error: classified.message }
+      // dryRun：只解析目标、回显，不投递。给调用方一条"先验证命中"的正路，免得它发消息试探。
+      if (args.dryRun === true) {
+        if (classified.target.kind === 'session') {
+          const resolved = await resolveSessionTarget(classified.target)
+          if (!resolved.ok) {
+            return { ok: false, dryRun: true, resolved: false, reason: resolved.reason, error: resolved.message, ...(resolved.candidates.length > 0 ? { candidates: resolved.candidates } : {}) }
+          }
+          return {
+            ok: true, dryRun: true, resolved: true,
+            target: { kind: 'session', sessionId: resolved.sessionId, deliver: classified.deliver },
+            ...(resolved.snippet === undefined ? {} : { snippet: resolved.snippet }),
+            ...(resolved.matchedBy === undefined ? {} : { matchedBy: resolved.matchedBy }),
+            ...(resolved.candidates.length > 0 ? { candidates: resolved.candidates } : {}),
+            note: '只解析目标，未投递任何消息',
+          }
+        }
+        const cwd = normalizeCwd(classified.target.cwd)
+        const lane = normalizeLane(classified.target.lane)
+        return { ok: true, dryRun: true, resolved: true, target: { kind: 'worker', cwd, lane }, note: '只解析目标，未派活' }
+      }
       const task = await enqueue(args.instruction, undefined, classified.target, args.model, 'task', classified.deliver, classified.notes)
       if (task.status === 'error') {
-        return { ok: false, taskId: task.taskId, reason: task.reason, error: task.error, ...(task.candidates === undefined ? {} : { candidates: task.candidates }) }
+        return { ok: false, taskId: task.taskId, reason: task.reason, error: task.error, ...(task.delivered === true ? { delivered: true } : {}), ...(task.candidates === undefined ? {} : { candidates: task.candidates }) }
       }
       const brief = { taskId: task.taskId, status: task.status, ...taskResponse(task) }
       if (args.wait !== true || timer === undefined) {
@@ -1171,7 +1311,7 @@ export async function apply(ctx) {
         if (Date.now() - t0 > 900000) return { ...brief, status: task.status, result: task.result, note: 'wait 超时' }
         await timer.timeout(2500)
       }
-      return { ...brief, status: task.status, result: task.result, error: task.error, reason: task.reason }
+      return { ...brief, status: task.status, result: task.result, error: task.error, reason: task.reason, ...(task.delivered === true ? { delivered: true, resend: false } : {}) }
     },
   })))
 

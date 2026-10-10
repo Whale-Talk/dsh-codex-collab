@@ -199,3 +199,36 @@ test('POST /task: session dispatch preserves queue and steer delivery modes', as
     assert.equal(harness.owners.length, 0)
   }
 })
+
+test('POST /task: session dispatch reports delivered once the prompt is accepted', async () => {
+  const harness = await makeHarness()
+  const task = harness.routes.get('/api/dsh-bridge/task')
+
+  const res = await callJson(task, {
+    instruction: '投递并标记已送达',
+    target: { kind: 'session', sessionId: 'session-delivered' },
+  })
+
+  assert.equal(res.statusCode, 202)
+  // 关键：prompt 被接受就等于"消息已进会话队列"，调用方据此不再重发。
+  assert.equal(res.body.delivered, true)
+  assert.equal(harness.prompts.length, 1)
+})
+
+test('POST /task: dryRun resolves the target and never dispatches', async () => {
+  const harness = await makeHarness()
+  const task = harness.routes.get('/api/dsh-bridge/task')
+
+  const session = await callJson(task, { dryRun: true, target: { kind: 'session', sessionId: 'session-probe' } })
+  assert.equal(session.statusCode, 200)
+  assert.equal(session.body.dryRun, true)
+  assert.equal(session.body.resolved, true)
+  assert.equal(session.body.target.sessionId, 'session-probe')
+  assert.equal(harness.prompts.length, 0)
+
+  const worker = await callJson(task, { dryRun: true, cwd: 'E:/tmp/dry-run', lane: 'main' })
+  assert.equal(worker.statusCode, 200)
+  assert.deepEqual(worker.body.target, { kind: 'worker', cwd: 'E:\\tmp\\dry-run', lane: 'main' })
+  assert.equal(harness.starts.length, 0)
+  assert.equal(harness.owners.length, 0)
+})
