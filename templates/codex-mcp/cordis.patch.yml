@@ -10,6 +10,9 @@
 #   B) 把本目录当作一个 bundle 安装（路径写绝对路径）：
 #        dsh plugin --profile <profile> add <本目录绝对路径>
 #
+# 注意：主包 @whaletalk/dsh-codex-collab 已内置等价的一行；本文件是**独立版本**，
+# 用于只想单独挂反向通道、或想单独调参的场景。
+#
 # 装完必须**重启 profile 进程**：新增组合包不会热挂载，只有重启后工具才会出现。
 # 之后在 DSH 侧的工具列表里找 mcp__codex__*（例如 mcp__codex__codex）。
 - insert:
@@ -19,22 +22,17 @@
         serverName: codex
         transport: stdio
 
-        # ---- Windows（最常见的坑）----
-        # npm 装的 codex 是 .cmd 垫片，而 DSH 的 stdio transport 直接 spawn
-        # （不经 shell），spawn 一个 .cmd 在 Windows 上会 EINVAL。
-        # 所以用 node 跑垫片背后的 JS；把 <you> 换成你的用户名。
-        command: node
-        args:
-          - 'C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js'
-          - 'mcp-server'
+        # 裸名 `codex` 跨平台可用：DSH 的 MCP 客户端用官方 SDK 的
+        # StdioClientTransport，内部是 cross-spawn（shell:false），在 Windows 上
+        # 也能正确解析 npm 的 .cmd 垫片（本机实测 exit 0）。
+        command: codex
+        args: ['mcp-server']
 
-        # 更稳的写法（绕开 PATH 与垫片，直接指向平台二进制；路径随版本略有不同）：
+        # 若 codex 不在 DSH 进程的 PATH 上，改成下面任一种：
+        #   command: node
+        #   args: ['C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js', 'mcp-server']
+        # 或直接指向平台二进制：
         #   command: 'C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
-        #   args: ['mcp-server']
-
-        # ---- macOS / Linux ----
-        # 垫片本身是可执行文件，直接写命令名即可：
-        #   command: codex
         #   args: ['mcp-server']
 
         # 远端 Codex（有人把 mcp-server 包成 HTTP 时）用：

@@ -1,5 +1,10 @@
 # templates/codex-mcp —— 反向通道：让 DSH 调用 Codex
 
+> **注意：主包已内置这一行。** 装 `@whaletalk/dsh-codex-collab` 时会同时挂上
+> `dsh-bridge`（Codex → DSH 派活）和 `codex-mcp`（DSH → Codex），不需要再单独装。
+> 本目录是**独立版本**：只想用反向通道、或想单独调参时用。关掉内置的那一行只需在
+> profile 的 `cordis.patch.yml` 里覆盖 `- id: codex-mcp` + `disabled: true`。
+
 把 **Codex CLI 当作 MCP 服务端**挂进 DeepSeek Harness，于是 DSH 侧的 agent（包括
 本插件派出去的 worker）会拿到 `mcp__codex__*` 工具，可以把活**交回 Codex**。
 
@@ -31,22 +36,25 @@ dsh plugin --profile desktop add "<本目录绝对路径>"
 | `failOnStartupError` | `false` = 连不上也照常启动 harness，只是没有这批工具 |
 | `toolCallTimeoutMs` | 每次 `tools/call` 超时；**默认只有 60s**，Codex 跑一轮常常不够，建议 600000 |
 
-### Windows 的坑（必读）
+### `command` 怎么写（Windows 也能用裸名）
 
-npm 安装的 `codex` 是 `.cmd` 垫片，而 DSH 的 stdio transport 是**直接 spawn**
-（不经过 shell）——在 Windows 上 spawn 一个 `.cmd` 会 `EINVAL`。三种可用写法：
+**默认写裸名 `codex` 即可，跨平台。** DSH 的 MCP 客户端走官方 SDK 的
+`StdioClientTransport`，它内部用 **cross-spawn**（`shell: false`）spawn——cross-spawn
+在 Windows 上会正确解析 npm 的 `.cmd` 垫片。实测：
+
+```
+cross-spawn('codex', ['--version']) → exit 0, "codex-cli 0.147.0"
+```
+
+只有当 `codex` 不在 DSH 进程的 PATH 上（或你想完全绕开 npm 垫片）时才需要换写法：
 
 ```yaml
-# 1) node 跑垫片背后的 JS（模板默认，可移植）
+# 备选 1：node 跑垫片背后的 JS
 command: node
 args: ['C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js', 'mcp-server']
 
-# 2) 直接指向平台二进制（最稳，路径随版本/架构略有不同）
+# 备选 2：直接指向平台二进制（路径随版本/架构略有不同）
 command: 'C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
-args: ['mcp-server']
-
-# 3) macOS / Linux：垫片本身可执行，直接写命令名
-command: codex
 args: ['mcp-server']
 ```
 

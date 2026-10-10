@@ -1,20 +1,45 @@
-# DSH Collab bundle layer — 双向编码协作网关。
+# DSH Collab bundle layer —— 双向协作：Codex → DSH 派活 + DSH → Codex 反向调用。
 #
 # 安装（npm）：
-#   dsh plugin --profile web add @whaletalk/dsh-codex-collab
-# `dsh plugin add` 会把本包加入 profile 的 dsh.profile.bundles，并自动套用本
-# patch，无需手工复制 dsh-bridge.mjs。
+#   dsh plugin --profile desktop add @whaletalk/dsh-codex-collab
+# `dsh plugin add` 会把本包加入 profile 的 dsh.profile.bundles，并自动套用本 patch。
 #
-# 下面这一行把宿主网关插件插进 bundle：
-#   - id  dsh-bridge       —— 行 id。用户的 patch 层可用同 id 覆盖整段 config。
-#   - name用包子路径而非相对路径（对比 './dsh-bridge.mjs'）：只有这样从 npm 安装
-#     后解析器才能定位到包内文件，同时保持 profile 目录干净。
+# 本 bundle 插两行：
 #
-# 依赖的服务：webServer / agents / subagents / tools 四个注入，加上运行时取用的
-# timer、sessionQuery、agentPresets、sessionPersistence、workspaceRegistry、llm。
-# 其中 webServer 由 dsh-web-app 提供 —— 因此本 bundle 只能挂 web / desktop
-# profile，headless profile 没有该服务会一直 pending。
-# 本插件不使用 workflowEngine，所以 web GUI 默认禁用 workflow 引擎不影响它。
+# 1) dsh-bridge —— 宿主网关插件（Codex → DSH 的派活通道）
+#    - id  行 id；用户的 patch 层可用同 id 覆盖整段 config。
+#    - name 用包子路径而非相对路径（对比 './dsh-bridge.mjs'）：只有这样从 npm 安装
+#      后解析器才能定位到包内文件，同时保持 profile 目录干净。
+#    依赖的服务：webServer / agents / subagents / tools 四个注入，加上运行时取用的
+#    timer、sessionQuery、agentPresets、sessionPersistence、workspaceRegistry、llm。
+#    其中 webServer 由 dsh-web-app 提供 —— 因此本 bundle 只能挂 web / desktop
+#    profile，headless profile 没有该服务会一直 pending。
+#    本插件不使用 workflowEngine，所以 web GUI 默认禁用 workflow 引擎不影响它。
+#
+# 2) codex-mcp —— 反向通道（DSH → Codex）
+#    把 Codex CLI 当 MCP 服务端挂进来：DSH 侧 agent 会拿到 mcp__codex__* 工具，
+#    可以把活交回 Codex。两端都是现成的（DSH 自带 @deepseek-ai/dsh-mcp-client，
+#    Codex 自带 `codex mcp-server`），这里只是配置。
+#
+#    - command 写裸名 `codex` 即可跨平台：MCP SDK 的 stdio 用 cross-spawn
+#      （shell:false）spawn，它在 Windows 上会正确解析 npm 的 .cmd 垫片。
+#      若你的 codex 不在 PATH 上，改成 `node` + args 指向
+#      `...\@openai\codex\bin\codex.js`，或直接指向平台 codex.exe。
+#    - toolCallTimeoutMs 默认只有 60s，Codex 跑一轮读仓库常常不够。
+#    - failOnStartupError:false：没装/没登录 Codex 时只是这批工具不出现并记一条
+#      日志，不会拖垮 harness。
+#    - 不需要反向通道？在 profile 的 cordis.patch.yml 里加一行覆盖即可关掉：
+#        - id: codex-mcp
+#          disabled: true
 - insert:
     - id: dsh-bridge
       name: '@whaletalk/dsh-codex-collab/bridge'
+    - id: codex-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: codex
+        transport: stdio
+        command: codex
+        args: ['mcp-server']
+        failOnStartupError: false
+        toolCallTimeoutMs: 600000

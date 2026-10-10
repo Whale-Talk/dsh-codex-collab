@@ -193,7 +193,7 @@ jobs:
             console.log("bridge ok:", mod.name, "inject=[" + mod.inject.join(",") + "]");
           '
 
-      - name: Bundle patch points at the packaged subpath
+      - name: Bundle patch rows resolve
         run: |
           set -euo pipefail
           node -e '
@@ -204,13 +204,29 @@ jobs:
             if (!p.exports["./bridge"]) throw new Error("exports must expose ./bridge");
             // Inspect resolved rows only — prose in comments may quote the old
             // profile-relative form, so a naive substring check false-positives.
-            const rows = patch.split("\n").filter(l => /^\s*name:/.test(l));
-            if (!rows.length) throw new Error("patch declares no plugin rows");
-            for (const row of rows) {
-              if (!row.includes(sub)) throw new Error("row not on the packaged subpath: " + row.trim());
+            // Row = "- id: <id>" followed by its own "name:" line.
+            const lines = patch.split("\n");
+            const rows = new Map();
+            for (let i = 0; i < lines.length; i++) {
+              const id = /^\s*-\s*id:\s*(\S+)\s*$/.exec(lines[i]);
+              if (id === null) continue;
+              for (let j = i + 1; j < lines.length; j++) {
+                const name = /^\s*name:\s*(.+?)\s*$/.exec(lines[j]);
+                if (name !== null) { rows.set(id[1], name[1].replace(/^["\x27]|["\x27]$/g, "")); break; }
+              }
             }
-            if (!patch.includes("- id: dsh-bridge")) throw new Error("row id must be dsh-bridge");
-            console.log("patch ok:", rows.length, "row(s) on", sub);
+            if (rows.size === 0) throw new Error("patch declares no plugin rows");
+            if (rows.get("dsh-bridge") !== sub) {
+              throw new Error("dsh-bridge row must be " + sub + ", got " + rows.get("dsh-bridge"));
+            }
+            // The bundled reverse channel mounts DSH own MCP client; assert it is
+            // present and configured for the Codex CLI, since it ships to users.
+            if (rows.get("codex-mcp") !== "@deepseek-ai/dsh-mcp-client") {
+              throw new Error("codex-mcp row must be @deepseek-ai/dsh-mcp-client, got " + rows.get("codex-mcp"));
+            }
+            if (!/command:\s*codex\b/.test(patch)) throw new Error("codex-mcp row must launch the codex CLI");
+            if (!/args:\s*\[.mcp-server.\]/.test(patch)) throw new Error("codex-mcp row must pass mcp-server");
+            console.log("patch ok:", rows.size, "rows —", [...rows].map(([k, v]) => k + "=" + v).join(", "));
           '
 
   publish:

@@ -257,12 +257,14 @@ dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-…"
 （纯通知，不触发回合）、`sampling/createMessage`、`elicitation/create`（取决于客户端是否
 实现，且不等于"在对话里跑工具"）；ChatGPT 侧同样没有公开 API 能向用户会话投消息。
 
-### 方案 A：把 Codex 挂成 DSH 的 MCP 服务（推荐）
+### 方案 A：反向通道已内置在本包里（推荐）
 
-现成模板见 [`templates/codex-mcp/`](templates/codex-mcp/README.md)，原理是两端各有一个原生件：
+**装本包就同时得到两个方向**——`cordis.patch.yml` 里插了两行：`dsh-bridge`（Codex → DSH 派活）与 `codex-mcp`（DSH → Codex 反向调用）。原理是两端各有一个原生件：
 
 - DSH 侧 `@deepseek-ai/dsh-mcp-client`（harness 自带）：连外部 MCP 服务器，并把工具以 `mcp__<serverName>__<tool>` 注册进 `ctx.tools`；
 - Codex 侧 `codex mcp-server`（stdio）：把 Codex 暴露成 MCP 服务端。
+
+内置的那一行等价于：
 
 ```yaml
 - insert:
@@ -271,15 +273,17 @@ dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-…"
       config:
         serverName: codex
         transport: stdio
-        command: node
-        args: ['C:\Users\<you>\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js', 'mcp-server']
-        failOnStartupError: false
-        toolCallTimeoutMs: 600000
+        command: codex                 # 跨平台：SDK 用 cross-spawn，Windows 的 .cmd 垫片也能解析
+        args: ['mcp-server']
+        failOnStartupError: false      # 没装/没登录 Codex 只是没这批工具，不会拖垮 harness
+        toolCallTimeoutMs: 600000      # 默认只有 60s，Codex 跑一轮常常不够
 ```
 
-- **Windows 必读**：npm 装的 `codex` 是 `.cmd` 垫片，而 DSH 的 stdio 是**直接 spawn**（不经 shell），spawn `.cmd` 会 `EINVAL`——所以用 `node` 跑垫片背后的 `bin/codex.js`，或直接指向 `...\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe`。macOS/Linux 直接 `command: codex`。
-- `toolCallTimeoutMs` 默认只有 60s，Codex 跑一轮常常不够，模板给了 600000。
-- 装完需**重启 profile 进程**；连接失败不会拖垮 harness，只是这批工具不出现（日志里有原因）。
+- 前提：本机装了 Codex CLI 并已登录（`codex --version` / `codex mcp-server --help` 能跑）。
+- **不需要反向通道**？在 profile 的 `cordis.patch.yml` 里覆盖一行即可关掉：`- id: codex-mcp` + `disabled: true`。
+- 想单独用反向通道（不装本插件主体）可以用独立模板 [`templates/codex-mcp/`](templates/codex-mcp/README.md)。
+- 装完需**重启 profile 进程**；连接失败只是这批工具不出现（日志里有原因）。
+- 排查：若 `codex` 不在 DSH 进程的 PATH 上，把 `command` 换成 `node` + `args: ['<...>/@openai/codex/bin/codex.js', 'mcp-server']`，或直接指向平台 `codex.exe`。
 
 ### 方案 B：worker 里直接跑 `codex exec`
 
