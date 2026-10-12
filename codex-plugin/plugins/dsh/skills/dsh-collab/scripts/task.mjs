@@ -2,7 +2,9 @@
 // Codex → DeepSeek Harness 任务脚本：POST 指令到桥网关，可轮询等待结果。
 // 功能：--cwd 工作目录 / --lane 并行通道 / --model 模型别名 / --commit 完成后 Git 提交
 //       --wait 等待结果（默认）/ --list 任务列表 / --cancel <taskId> / --status <taskId>
-// 用法: node task.mjs --in "<指令>" [--cwd 目录] [--lane 名] [--model fast|pro] [--commit] [--timeout 秒]
+//       --origin <Codex对话id> 来源关联（跨回合精确收取；显式参数优先，其次本次调用的 CODEX_THREAD_ID）
+//       --my-tasks 列出本来源登记过的任务（找回丢失的 taskId）/ --require-origin 无来源则如实拒绝
+// 用法: node task.mjs --in "<指令>" [--cwd 目录] [--lane 名] [--model fast|pro] [--commit] [--timeout 秒] [--origin <id>]
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
@@ -22,7 +24,7 @@ const HISTORY_CANDIDATES = process.env.DSH_BRIDGE_HISTORY
 const HISTORY_MAX = 40
 
 function parseArgs(argv) {
-  const out = { wait: true, timeoutSec: 600, instruction: '', cwd: '', lane: '', model: '', commit: false, list: false, cancel: '', status: '', sessions: '', sessionId: '', find: '', steer: false, force: false }
+  const out = { wait: true, timeoutSec: 600, instruction: '', cwd: '', lane: '', model: '', commit: false, list: false, cancel: '', status: '', sessions: '', sessionId: '', find: '', steer: false, force: false, origin: '', myTasks: false, requireOrigin: false }
   const rest = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -43,10 +45,30 @@ function parseArgs(argv) {
     else if (a === '--steer') { out.steer = true }
     else if (a === '--dry-run') { out.dryRun = true }
     else if (a === '--force') { out.force = true }
+    else if (a === '--origin') {
+      // 严格：来源 id 必须紧跟一个非空、不以 -- 开头的值；否则按用法错误处理（不静默降级）。
+      const v = argv[++i]
+      if (v === undefined || v.trim() === '' || v.startsWith('--')) { out.originError = '--origin 需要一个值（Codex 对话 id）'; continue }
+      out.origin = v.trim()
+    }
+    else if (a === '--my-tasks') { out.myTasks = true }
+    else if (a === '--require-origin') { out.requireOrigin = true }
     else { rest.push(a) }
   }
   if (!out.instruction && rest.length > 0) out.instruction = rest.join(' ')
   return out
+}
+
+/**
+ * 解析来源对话 id：**显式参数优先**，其次本次调用的 CODEX_THREAD_ID（CLI 每次都是独立进程，
+ * 因此这个环境变量确实是"这一次调用"的上下文）。绝不使用常驻进程的启动环境或"最近对话"推断。
+ * @returns {{originThreadId?: string, source: 'explicit'|'env'|'none'}}
+ */
+function resolveOrigin(opts) {
+  if (typeof opts.origin === 'string' && opts.origin.trim() !== '') return { originThreadId: opts.origin.trim(), source: 'explicit' }
+  const fromEnv = typeof process.env.CODEX_THREAD_ID === 'string' ? process.env.CODEX_THREAD_ID.trim() : ''
+  if (fromEnv !== '') return { originThreadId: fromEnv, source: 'env' }
+  return { source: 'none' }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -80,6 +102,51 @@ function request(method, urlStr, body) {
     if (payload !== undefined) req.write(payload)
     req.end()
   })
+}
+
+/**
+ * 只读核验网关是否真的支持"持久来源绑定"（GET /status，不会派活）。
+ * **不靠包版本猜**：旧网关会忽略 originThreadId 并照常 accepted → 产生"未绑定"任务。
+ */
+async function originBindingSupported() {
+  try {
+    const res = await request('GET', GATEWAY + '/api/dsh-bridge/status')
+    const body = res.json
+    return body !== null && typeof body === 'object'
+      && body.capabilities !== null && typeof body.capabilities === 'object'
+      && body.capabilities.originBinding !== null && typeof body.capabilities.originBinding === 'object'
+      && body.capabilities.originBinding.supported === true
+  } catch (e) {
+    return false
+  }
+}
+
+/** 只要这次调用真的会带上来源，就必须先确认网关支持；否则明确拒绝（绝不静默变成无关联派活）。 */
+async function requireOriginSupport(origin) {
+  if (origin.originThreadId === undefined) return true
+  if (await originBindingSupported()) return true
+  console.error('task.mjs: 该网关不支持持久来源绑定（/status 未上报 capabilities.originBinding）。旧网关会忽略 originThreadId 并照常 accepted，从而产生"未绑定"的任务。')
+  console.error('已拒绝执行；请先升级 DSH profile 里的 dsh-codex-collab 插件，或去掉 --origin 使用旧的无关联模式。')
+  return false
+}
+
+/** 网关自己给出的"明确拒绝"reason：原样透传（这些不是"成功了但没确认"）。 */
+const REFUSAL_REASONS = new Set(['origin-required', 'origin-mismatch', 'invalid-origin', 'unknown-task', 'execution-state-unconfirmed'])
+
+/** 网关必须**回显并匹配**我们请求的 originThreadId，才算确认了这次绑定/取值。 */
+function originConfirmed(payload, origin) {
+  return payload !== null && typeof payload === 'object' && payload.originThreadId === origin.originThreadId
+}
+
+/**
+ * 能力检查通过 ≠ 这次绑定被确认：网关可能中途换过处理者（重载/旧 handler），接受了请求却没写关联。
+ * 此时任务**可能已经执行**——既不能说成功，也绝不能重发。
+ */
+function unconfirmedExit(origin, extra) {
+  console.error('task.mjs: 网关接受了请求但没有确认来源绑定（响应里没有匹配的 originThreadId）。这次任务可能已经在无关联模式下执行——**不要重发**；请用 --my-tasks/--status 复核，并检查 DSH profile 里的 dsh-codex-collab 插件版本。')
+  console.error('task.mjs: 来源关联 originThreadId=' + origin.originThreadId + '（' + (origin.source === 'explicit' ? '--origin' : 'CODEX_THREAD_ID') + '）')
+  console.log(JSON.stringify({ phase: 'unconfirmed', reason: 'origin-not-confirmed', resend: false, ...extra }))
+  finish(8)
 }
 
 // ---- 历史：多位置读取合并 + 逐级降级写入 ----
@@ -151,21 +218,54 @@ function gitCommit(cwd, message) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2))
+  const origin = resolveOrigin(opts)
+
+  if (opts.originError !== undefined) {
+    console.error('task.mjs: ' + opts.originError)
+    finish(2)
+  }
+
+  // --my-tasks：只给来源时列出该对话登记过的任务，用来找回丢失的 taskId。
+  // 没有任何来源（既没显式给，也没有本次调用的 CODEX_THREAD_ID）→ 如实拒绝，绝不猜"最近对话"。
+  if (opts.myTasks) {
+    if (origin.originThreadId === undefined) {
+      console.error('task.mjs: --my-tasks 需要来源对话 id：请显式传 --origin <Codex对话id>，或确保本次调用的环境里有 CODEX_THREAD_ID')
+      finish(2)
+    }
+    if (!(await requireOriginSupport(origin))) finish(2)
+    const res = await request('GET', GATEWAY + '/api/dsh-bridge/status?originThreadId=' + encodeURIComponent(origin.originThreadId))
+    if (res.json !== null && typeof res.json === 'object' && !originConfirmed(res.json, origin)) unconfirmedExit(origin, {})
+    console.log(JSON.stringify(res.json, null, 2))
+    finish(res.status === 200 ? 0 : 1)
+  }
 
   if (opts.list) {
-    const res = await request('GET', GATEWAY + '/api/dsh-bridge/tasks')
+    if (!(await requireOriginSupport(origin))) finish(2)
+    const res = await request('GET', GATEWAY + '/api/dsh-bridge/tasks' + (origin.originThreadId === undefined ? '' : '?originThreadId=' + encodeURIComponent(origin.originThreadId)))
+    if (origin.originThreadId !== undefined && res.json !== null && typeof res.json === 'object' && !originConfirmed(res.json, origin)) unconfirmedExit(origin, {})
     console.log(JSON.stringify(res.json, null, 2))
     finish(0)
   }
   if (opts.cancel) {
-    const res = await request('POST', GATEWAY + '/api/dsh-bridge/cancel', { taskId: opts.cancel, force: opts.force === true })
+    if (!(await requireOriginSupport(origin))) finish(2)
+    const res = await request('POST', GATEWAY + '/api/dsh-bridge/cancel', { taskId: opts.cancel, force: opts.force === true, ...(origin.originThreadId === undefined ? {} : { originThreadId: origin.originThreadId }) })
+    if (origin.originThreadId !== undefined && res.json !== null && typeof res.json === 'object' && res.json.cancelled === true && !originConfirmed(res.json, origin)) unconfirmedExit(origin, { taskId: opts.cancel })
     console.log(JSON.stringify(res.json, null, 2))
     finish(res.status === 409 ? 5 : 0)
   }
   if (opts.status) {
-    const res = await request('GET', GATEWAY + '/api/dsh-bridge/status?taskId=' + encodeURIComponent(opts.status))
-    console.log(JSON.stringify(res.json, null, 2))
-    finish(0)
+    if (!(await requireOriginSupport(origin))) finish(2)
+    const res = await request('GET', GATEWAY + '/api/dsh-bridge/status?taskId=' + encodeURIComponent(opts.status) + (origin.originThreadId === undefined ? '' : '&originThreadId=' + encodeURIComponent(origin.originThreadId)))
+    const body = res.json
+    const refused = body !== null && typeof body === 'object' && typeof body.reason === 'string' && REFUSAL_REASONS.has(body.reason)
+    // 精确取值必须由网关**确认来源**；没确认就不算读到（也绝不把网关 body 里的结果打出来）。
+    if (origin.originThreadId !== undefined && !refused && !originConfirmed(body, origin)) {
+      unconfirmedExit(origin, { taskId: opts.status })
+    }
+    console.log(JSON.stringify(body, null, 2))
+    // 非 200 = 没读到任务（未知 taskId / 已关联但缺来源 / 来源不匹配）→ 明确非零。
+    // 读到任务（含旧的无来源未关联任务）仍是 0，兼容不变。
+    finish(res.status === 200 ? 0 : 6)
   }
   if (opts.sessions) {
     const res = await request('POST', GATEWAY + '/api/dsh-bridge/sessions', { query: opts.sessions, inspect: true, limit: 20 })
@@ -215,12 +315,14 @@ async function main() {
   }
 
   if (!instruction) {
-    console.error('用法: node task.mjs --in "<指令>" [--cwd 目录] [--lane 名] [--model fast|pro] [--commit] [--timeout 秒] [--no-wait]')
+    console.error('用法: node task.mjs --in "<指令>" [--cwd 目录] [--lane 名] [--model fast|pro] [--commit] [--timeout 秒] [--no-wait] [--origin <Codex对话id>]')
     console.error('      node task.mjs --in "<指令>" (--session <会话id> | --find "<标题关键词>") [--steer]   # 投递进已有会话')
     console.error('查找: node task.mjs --sessions "<标题关键词>"   # 只读列出候选, 拿 sessionId 再派活')
     console.error('      node task.mjs --dry-run (--find "<关键词>" | --session <id>)   # 只解析目标, 不投递（验证命中用这个）')
-    console.error('管理: node task.mjs --list | --status <taskId> | --cancel <taskId> [--force]')
-    console.error('退出码: 0 成功 / 1 失败 / 2 用法 / 3 超时 / 4 会话未命中或不唯一 / 5 session 目标取消被拒')
+    console.error('管理: node task.mjs --list [--origin <id>] | --status <taskId> [--origin <id>] | --cancel <taskId> [--force] [--origin <id>]')
+    console.error('来源: node task.mjs --my-tasks [--origin <id>]   # 列出该 Codex 对话登记过的任务（找回丢失的 taskId）')
+    console.error('      来源 id 优先取 --origin，其次本次调用的环境变量 CODEX_THREAD_ID；--require-origin 表示没有来源就拒绝派活。')
+    console.error('退出码: 0 成功 / 1 失败 / 2 用法（含缺少来源） / 3 超时 / 4 会话未命中或不唯一 / 5 session 目标取消被拒 / 6 查询不到该任务（未知或来源不匹配）')
     finish(2)
   }
   if (sessionTarget !== null && (cwd !== '' || opts.commit)) {
@@ -234,8 +336,17 @@ async function main() {
     }
   }
   const history = sessionTarget === null ? readHistory() : []
+  // --require-origin：要求这次派活必须带上来源关联；拿不到来源就如实拒绝（不静默降级成无关联）。
+  if (opts.requireOrigin === true && origin.originThreadId === undefined) {
+    console.error('task.mjs: --require-origin 已指定，但拿不到来源对话 id：请显式传 --origin <Codex对话id>，或确保本次调用的环境里有 CODEX_THREAD_ID。')
+    console.error('（不会降级成"无关联派活"——那会让结果无法按来源精确收回。）')
+    finish(2)
+  }
+  // 要带来源就必须先确认网关真的支持（只读 GET，不派活）；不支持 → 零执行拒绝。
+  if (!(await requireOriginSupport(origin))) finish(2)
   const posted = await request('POST', GATEWAY + '/api/dsh-bridge/task', {
     instruction,
+    ...(origin.originThreadId === undefined ? {} : { originThreadId: origin.originThreadId }),
     ...(sessionTarget === null
       ? {
           ...{ history },
@@ -254,7 +365,14 @@ async function main() {
     console.error(String(posted.text || '').slice(0, 200))
     finish(1)
   }
-  console.log(JSON.stringify({ phase: 'submitted', ...task }))
+  if (origin.originThreadId !== undefined && task.taskId !== undefined && !originConfirmed(task, origin)) {
+    // 网关接受了请求，却没有回显我们的来源：绑定**未被确认**（可能已经无关联地执行了）→ 不要重发。
+    unconfirmedExit(origin, { taskId: task.taskId })
+  }
+  if (origin.originThreadId !== undefined) {
+    console.error('task.mjs: 来源关联 originThreadId=' + origin.originThreadId + '（' + (origin.source === 'explicit' ? '--origin' : 'CODEX_THREAD_ID') + '）')
+  }
+  console.log(JSON.stringify({ phase: task.taskId === undefined ? 'rejected' : 'submitted', ...task }))
   if (task.reason === 'session-ambiguous' || task.reason === 'session-query-empty') {
     console.error('task.mjs: ' + (task.error || task.reason))
     if (Array.isArray(task.candidates) && task.candidates.length > 0) {
@@ -262,6 +380,11 @@ async function main() {
       for (const c of task.candidates) console.error('  ' + c.sessionId + '  ' + c.snippet)
     }
     finish(4)
+  }
+  if (task.taskId === undefined) {
+    // 网关明确拒绝了这次派活（例如同一通道还有在途任务、来源非法）——非零退出，别让调用方以为派出去了。
+    console.error('task.mjs: 派活被拒绝: ' + (task.error || 'unknown error') + (task.reason === undefined ? '' : '（reason=' + task.reason + '）'))
+    finish(task.reason === 'worker-bucket-busy' || task.reason === 'reviewer-bucket-busy' ? 7 : 1)
   }
   if (posted.status !== 202 || task.status === 'error') {
     console.error('task.mjs: ' + (task.error || task.reason || 'submission failed'))

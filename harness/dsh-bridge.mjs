@@ -21,6 +21,12 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+  ASSOC_REASONS,
+  isValidOrigin,
+  openAssociations,
+} from './codex-associations.mjs'
+import { rememberTask } from './task-table.mjs'
+import {
   REASONS,
   textOfBlocks,
   assistantTextOf,
@@ -34,6 +40,10 @@ import {
   looksLikeDisabledSearch,
   rankTitleCandidates,
   taskResponse,
+  createRequestTracker,
+  consumeSessionEvent,
+  consumeSnapshotFrame,
+  turnOutcome,
 } from './session-target.mjs'
 
 export const name = 'dsh-bridge'
@@ -204,6 +214,146 @@ export async function apply(ctx) {
   const tasks = []
   const sockets = new Set()
 
+  /** 把持久记录投影成"跨回合可读"的形态。 */
+  const projectStoredTask = (record) => {
+    const liveTask = tasks.find((t) => t.taskId === record.taskId)
+    const terminal = record.status === 'done' || record.status === 'error' || record.status === 'cancelled'
+    const base = {
+      taskId: record.taskId,
+      originThreadId: record.originThreadId,
+      kind: record.kind,
+      target: record.target,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      live: liveTask !== undefined,
+      ...(record.requestId === undefined ? {} : { requestId: record.requestId }),
+      ...(record.dshTurn === undefined ? {} : { dshTurn: record.dshTurn }),
+    }
+    if (liveTask !== undefined) {
+      return {
+        ...base,
+        status: liveTask.status,
+        ...(liveTask.result === undefined ? {} : { result: liveTask.result }),
+        ...(liveTask.error === undefined ? {} : { error: liveTask.error }),
+        ...(liveTask.delivered === undefined ? {} : { delivered: liveTask.delivered }),
+      }
+    }
+    if (terminal) {
+      return {
+        ...base,
+        status: record.status,
+        ...(record.result === undefined ? {} : { result: record.result }),
+        ...(record.error === undefined ? {} : { error: record.error }),
+        ...(record.delivered === undefined ? {} : { delivered: record.delivered }),
+      }
+    }
+    // 没有本实例运行上下文的非终态记录：**只能**标未知，绝不谎报"还在被本实例观察"。
+    return {
+      ...base,
+      status: 'unknown',
+      persistedStatus: record.status,
+      reason: 'execution-state-unconfirmed',
+      resend: false,
+      note: '这条任务在执行/交付未确认前就失去了运行时上下文（网关重载或新实例）；本实例不观察它、不重发。原目标见 target。',
+    }
+  }
+
+  /** 同通道已有在途任务：明确拒绝，而不是把完成结果猜给某个 pending。 */
+  const rejectBusy = (fields) => {
+    const task = {
+      taskId: uid(), kind: fields.kind, instruction: fields.instruction,
+      cwd: fields.cwd, lane: fields.lane, bucketKey: fields.bucketKey,
+      target: fields.target, status: 'error', time: Date.now(), result: undefined,
+      error: fields.error, reason: fields.reason,
+      ...(fields.activeTaskId === undefined ? {} : { activeTaskId: fields.activeTaskId }),
+    }
+    rememberTask(tasks, task)
+    // 仍然登记来源（如果调用方给了）：让调用方能按来源查到"这次被拒绝了"。
+    const bound = bindAssociation(task, fields.originThreadId)
+    if (bound.ok) persistTask(task)
+    pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, cwd: fields.cwd, kind: fields.kind, ...(fields.activeTaskId === undefined ? {} : { activeTaskId: fields.activeTaskId }) })
+    return task
+  }
+
+  /**
+   * 把任务关联存储（R1）：把「来源 Codex 对话 → taskId → 执行目标」持久化，供跨回合精确收取。
+   * 打不开就置 null——此时**来源关联模式一律拒绝**，绝不静默降级成"无关联"执行。
+   */
+  const associations = (() => {
+    try {
+      return openAssociations({
+        root: process.env.DSH_BRIDGE_ASSOC_DIR,
+        namespace: process.env.DSH_BRIDGE_ASSOC_NAMESPACE,
+        profile: process.env.DSH_PROFILE,
+      })
+    } catch (e) {
+      console.error('[dsh-bridge] association store unavailable:', errText(e).slice(0, 300))
+      return null
+    }
+  })()
+
+  /**
+   * 从请求体/查询串解析 originThreadId：
+   *   - **字段未传（或 undefined）** → 旧的"无关联"模式，保持兼容；
+   *   - **显式给了值** → 必须是合法非空字符串。空串 / null / 纯空白 / 非字符串一律拒绝，
+   *     绝不静默回落成"无关联"（那会让调用方以为绑定成功、实际产生未绑定任务）。
+   */
+  const originOf = (parsed) => {
+    if (parsed === null || typeof parsed !== 'object') return { ok: true, originThreadId: undefined }
+    if (!Object.prototype.hasOwnProperty.call(parsed, 'originThreadId')) return { ok: true, originThreadId: undefined }
+    const raw = parsed.originThreadId
+    if (raw === undefined) return { ok: true, originThreadId: undefined }
+    if (!isValidOrigin(raw)) return { ok: false }
+    return { ok: true, originThreadId: raw.trim() }
+  }
+
+  /** 能力上报：客户端在**派活前**只读核验本网关是否真的支持持久来源绑定（旧网关没有这一块）。 */
+  const capabilityReport = () => ({
+    originBinding: associations === null
+      ? { supported: false, version: 0, reason: 'association-store-unavailable' }
+      : { supported: true, version: 1, persistence: 'append-only-jsonl', namespace: associations.namespace },
+  })
+
+  /**
+   * 执行前登记关联。失败即返回错误，调用方必须放弃启动 DSH 执行——
+   * 绝不出现"执行了却没绑定"。
+   */
+  const bindAssociation = (task, originThreadId) => {
+    if (originThreadId === undefined) return { ok: true }
+    if (associations === null) {
+      return { ok: false, reason: 'association-store-unavailable', message: 'the task association store could not be opened in this gateway; refusing to dispatch an origin-bound task' }
+    }
+    try {
+      associations.bind({ originThreadId, taskId: task.taskId, kind: task.kind, target: task.target })
+      task.originThreadId = originThreadId
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, reason: e !== null && typeof e === 'object' && typeof e.reason === 'string' ? e.reason : 'association-bind-failed', message: errText(e) }
+    }
+  }
+
+  /** 把任务当前状态写回持久关联记录（终态/失败/取消/交付确认都调用）。 */
+  const persistTask = (task) => {
+    if (task === undefined || task === null || task.originThreadId === undefined || associations === null) return
+    try {
+      associations.update(task.taskId, {
+        status: task.status,
+        delivered: task.delivered,
+        result: task.result,
+        error: task.error,
+        reason: task.reason,
+        stopReason: task.stopReason,
+        requestId: task.requestId,
+        dshTurn: task.dshTurn,
+      })
+      delete task.associationError
+    } catch (e) {
+      // 明确暴露，绝不静默：任务本身的结果不受影响，但调用方能在状态里看到关联写入失败。
+      task.associationError = errText(e)
+      console.error('[dsh-bridge] association update failed for', task.taskId, ':', errText(e).slice(0, 200))
+    }
+  }
+
   const broadcast = (msg) => {
     let line
     try { line = JSON.stringify(msg) + '\n' } catch (e) { return }
@@ -341,6 +491,7 @@ export async function apply(ctx) {
       task.stopReason = info.stopReason
       remember('user', task.instruction)
       remember('assistant', task.result)
+      persistTask(task)
       pushTask(task.taskId, 'result', { text: task.result, stopReason: info.stopReason, childId: bucket.childId, cwd: bucket.cwd, kind: task.kind })
     } else {
       broadcast({ type: 'result', taskId: null, childId: bucket.childId, time: Date.now(), text, stopReason: info.stopReason, cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
@@ -529,6 +680,17 @@ export async function apply(ctx) {
     if (fields.reason !== undefined) task.reason = fields.reason
     if (fields.stopReason !== undefined) task.stopReason = fields.stopReason
     if (fields.delivered !== undefined) task.delivered = fields.delivered
+    if (fields.partialResult !== undefined) task.partialResult = fields.partialResult
+    if (fields.turnEndKind !== undefined) task.turnEndKind = fields.turnEndKind
+    if (fields.note !== undefined) task.note = fields.note
+    if (fields.resend !== undefined) task.resend = fields.resend
+    // 精确关联模式：回显这次请求的 requestId 与匹配到的 DSH turn（便于跨回合核对归属）。
+    if (record.precise === true) {
+      task.requestId = record.taskId
+      task.dshTurn = record.tracker === undefined ? undefined : record.tracker.turn
+    }
+    // 终态（done/error/cancelled/timeout/unknown）一律写回持久关联记录。
+    persistTask(task)
     pushTask(task.taskId, status === 'done' ? 'result' : 'error', {
       ...(task.result === undefined ? {} : { text: task.result }),
       ...(task.error === undefined ? {} : { error: task.error }),
@@ -537,10 +699,66 @@ export async function apply(ctx) {
     })
   }
 
+  /**
+   * 把"读日志"当成一次**观察机会**（不是完成证明）：把日志事件喂给关联器。
+   * 与 live follow 共用同一套规则，靠 seq 去重。
+   */
+  const observeSessionLog = async (record) => {
+    if (sessionQuery === undefined) return
+    try {
+      const snap = await sessionQuery.readSession(record.sessionId)
+      const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
+      for (const event of events) consumeSessionEvent(record.tracker, event)
+    } catch (e) {
+      console.error('[dsh-bridge] session observation failed:', errText(e).slice(0, 200))
+    }
+  }
+
+  /** 精确模式下的进度推送：只推自己那个 turn 的**新增**文本。 */
+  const pushPreciseProgress = (record) => {
+    const text = record.tracker === undefined ? '' : record.tracker.text
+    if (text.length <= record.reported) return
+    const delta = text.slice(record.reported)
+    record.reported = text.length
+    record.activeSince = Date.now()
+    const task = tasks.find((t) => t.taskId === record.taskId)
+    if (task !== undefined && task.status === 'accepted') task.status = 'running'
+    pushTask(record.taskId, 'progress', { text: delta, target: { kind: 'session', sessionId: record.sessionId } })
+  }
+
+  /**
+   * 依据关联器收尾：只有该请求自己的 turn 以 `completed` 结束才算成功；
+   * 其他 kind（aborted/blocked/error/max-tokens/interrupted/forked/unknown）都是**明确的终态失败**。
+   */
+  const settleFromTracker = (record) => {
+    const outcome = turnOutcome(record.tracker.end)
+    const text = record.tracker.text.trim()
+    if (outcome.ok) {
+      settleSessionTask(record, 'done', { result: text === '' ? '(无输出)' : text, stopReason: 'request-turn-completed' })
+      return
+    }
+    settleSessionTask(record, 'error', {
+      error: 'the DSH turn for this request ended as "' + outcome.kind + '" (only "completed" is success)',
+      reason: REASONS.TURN_FAILED,
+      turnEndKind: outcome.kind,
+      ...(text === '' ? {} : { partialResult: text }),
+    })
+  }
+
   /** 收尾时以「持久日志 + 派发前基线」为准，避免只信流式片段。 */
   const finishSessionTask = (record, stopReason) => {
     if (record.settled) return
     void (async () => {
+      // 精确关联模式（带来源）：running→idle 只是"可以读一次日志"的机会，不是完成证明。
+      // 只有读到自己请求那个 turn 的 turn/end 才收尾；否则保持未确认，绝不拿旧回合或不相关的
+      // 全会话 idleness 判成 done。
+      if (record.precise === true) {
+        await observeSessionLog(record)
+        if (record.settled) return
+        if (record.tracker.end !== undefined) { settleFromTracker(record); return }
+        record.lastObservation = { at: Date.now(), stopReason, sawRequest: record.tracker.sawRequest, turn: record.tracker.turn }
+        return
+      }
       let extractedText = ''
       if (sessionQuery !== undefined) {
         try {
@@ -571,7 +789,16 @@ export async function apply(ctx) {
         for await (const frame of stream) {
           if (record.settled) break
           if (frame === null || typeof frame !== 'object') continue
-          if (frame.type !== 'event') continue // snapshot 是派发前的历史，不作为本轮输出
+          // 精确关联模式：live 帧、开场 snapshot.records 与读日志共用同一套关联规则。
+          if (record.precise === true) {
+            const outcome = frame.type === 'snapshot'
+              ? consumeSnapshotFrame(record.tracker, frame)
+              : (frame.type === 'event' ? consumeSessionEvent(record.tracker, frame.event) : 'ignored')
+            if (outcome === 'progress') pushPreciseProgress(record)
+            if (outcome === 'settled') { settleFromTracker(record); break }
+            continue
+          }
+          if (frame.type !== 'event') continue // 旧路径：snapshot 是派发前的历史，不作为本轮输出
           const text = assistantTextOf(frame.event)
           if (text === '') continue
           record.total += text
@@ -590,15 +817,26 @@ export async function apply(ctx) {
   }
 
   /** 派发一条指令进已有会话。任何失败都不创建会话，只落一个 error 任务。 */
-  const dispatchToSession = async (instruction, target, deliver, notes, incomingHistory) => {
+  const dispatchToSession = async (instruction, target, deliver, notes, incomingHistory, originThreadId) => {
     const task = {
       taskId: uid(), kind: 'task', instruction,
       target: { kind: 'session', sessionId: target.sessionId, query: target.query, snippet: target.snippet },
       deliver, notes, status: 'accepted', time: Date.now(), result: undefined, error: undefined,
       cwd: undefined, lane: undefined, bucketKey: undefined,
     }
-    tasks.push(task)
-    if (tasks.length > 200) tasks.splice(0, tasks.length - 200)
+    rememberTask(tasks, task)
+
+    // 带来源的"精确关联模式"要求一个请求对应一个可判定的 turn；steer 会把整批 next-step 合并进
+    // 同一个 turn（多个 request 共用），无法为本次请求单独保证结果归属。执行前明确拒绝（零 prompt）。
+    if (originThreadId !== undefined && deliver === 'steer') {
+      const bound = bindAssociation(task, originThreadId)
+      task.status = 'error'
+      task.error = 'origin-bound session dispatch refuses deliver=steer: several requests can share one turn, so this request\'s result could not be attributed precisely. Use deliver=queue (or drop originThreadId for the legacy unbound behavior).'
+      task.reason = REASONS.ORIGIN_STEER_UNSUPPORTED
+      if (bound.ok) persistTask(task)
+      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason })
+      return { task, failed: { reason: task.reason, message: task.error, candidates: [] } }
+    }
 
     const resolved = await resolveSessionTarget(target)
     if (!resolved.ok) {
@@ -623,6 +861,16 @@ export async function apply(ctx) {
       return { task, failed: { reason: REASONS.BUSY, message: task.error, candidates: [] } }
     }
 
+    // 来源关联必须在**实际投递之前**落盘：绑定失败就不投递（宁可失败，也不出现"执行了却没绑定"）。
+    const bound = bindAssociation(task, originThreadId)
+    if (!bound.ok) {
+      task.status = 'error'
+      task.error = bound.message
+      task.reason = bound.reason
+      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, target: { kind: 'session', sessionId: resolved.sessionId } })
+      return { task, failed: { reason: bound.reason, message: bound.message, candidates: [] } }
+    }
+
     // 派发前取基线：结果只回报这一轮新产生的助手文本。
     let baseline = { count: 0, textLen: 0 }
     if (sessionQuery !== undefined) {
@@ -638,7 +886,10 @@ export async function apply(ctx) {
       sessionId: resolved.sessionId, taskId: task.taskId, deliver, baseline,
       total: '', sawRunning: false, activeSince: Date.now(), startedAt: Date.now(),
       settled: false, abort: undefined, watcher: 'pending',
-      // prompt 被接受 = 消息已进会话队列。此后就不该再把它当"没发出去"（见 sweepSessionTargets）。
+      // 精确关联模式（带来源）：靠 requestId→rpcId→turn 关联收结果，而不是派发前基线 + 全会话 idle。
+      precise: originThreadId !== undefined,
+      tracker: createRequestTracker(task.taskId),
+      reported: 0,      // prompt 被接受 = 消息已进会话队列。此后就不该再把它当"没发出去"（见 sweepSessionTargets）。
       delivered: false, queuedNoted: false,
     }
     sessionTargets.set(resolved.sessionId, record)
@@ -678,7 +929,7 @@ export async function apply(ctx) {
     return { task, failed: null }
   }
 
-  const enqueue = async (instruction, incomingHistory, target, modelAlias, kind, deliveryMode, notes) => {
+  const enqueue = async (instruction, incomingHistory, target, modelAlias, kind, deliveryMode, notes, originThreadId) => {
     if (incomingHistory !== undefined) syncHistory(incomingHistory)
     if (target !== undefined && target.kind === 'session') {
       // session 目标：不注册工作区、不建 owner、不建子代理，失败也不降级为新建。
@@ -687,6 +938,7 @@ export async function apply(ctx) {
         deliveryMode === undefined ? 'queue' : deliveryMode,
         Array.isArray(notes) ? notes : [],
         incomingHistory,
+        originThreadId,
       )
       return dispatched.task
     }
@@ -694,6 +946,19 @@ export async function apply(ctx) {
     const lane = normalizeLane(target === undefined ? undefined : target.lane)
     registerWorkspace(cwd)
     const bucket = bucketOf(cwd, lane)
+    // 同一通道（cwd+lane）只允许一个在途任务：完成事件只能定位到"这个桶里最老的 pending"，
+    // 两个并发任务会让结果归属变成猜测。这里明确拒绝（上一任务结束后再派下一条；不同 lane 不受影响）。
+    const activeInBucket = tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
+    if (activeInBucket !== undefined) {
+      return rejectBusy({
+        kind, instruction, cwd, lane, bucketKey: bucket.key,
+        target: { kind: 'worker', cwd, lane },
+        originThreadId,
+        activeTaskId: activeInBucket.taskId,
+        reason: 'worker-bucket-busy',
+        error: 'another task (' + activeInBucket.taskId + ') is still active on this channel; refusing to start a second one — its completion could not be attributed to a specific task. Wait for it to finish (or use another --lane).',
+      })
+    }
     const requestedModel = await resolveModel(modelAlias)
     if (requestedModel !== null && requestedModel !== bucket.model) {
       bucket.model = requestedModel
@@ -703,8 +968,16 @@ export async function apply(ctx) {
       bucket.seenCount = 0
     }
     const task = { taskId: uid(), kind, instruction, cwd, lane, bucketKey: bucket.key, target: { kind: 'worker', cwd, lane }, status: 'accepted', time: Date.now(), result: undefined, error: undefined }
-    tasks.push(task)
-    if (tasks.length > 200) tasks.splice(0, tasks.length - 200)
+    rememberTask(tasks, task)
+    // 来源关联必须在**实际派活之前**落盘：绑定失败就不派活。
+    const bound = bindAssociation(task, originThreadId)
+    if (!bound.ok) {
+      task.status = 'error'
+      task.error = bound.message
+      task.reason = bound.reason
+      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, cwd, kind })
+      return task
+    }
     try {
       const delivered = await deliver(bucket, instruction, ROLE_BRIEF(cwd), '[Codex 指令] ')
       if (delivered.fallback) {
@@ -714,6 +987,7 @@ export async function apply(ctx) {
         task.fallback = delivered.fallbackNote
         remember('user', instruction)
         remember('assistant', task.result)
+        persistTask(task)
         pushTask(task.taskId, 'result', { text: task.result, stopReason: delivered.stopReason, childId: null, cwd, kind })
       } else {
         bucket.activeSince = Date.now()
@@ -722,19 +996,40 @@ export async function apply(ctx) {
     } catch (e) {
       task.status = 'error'
       task.error = errText(e)
+      persistTask(task)
       pushTask(task.taskId, 'error', { error: task.error, cwd, kind })
     }
     return task
   }
 
-  const submitReview = async (rawCwd, diff, focus, incomingHistory) => {
+  const submitReview = async (rawCwd, diff, focus, incomingHistory, originThreadId) => {
     if (incomingHistory !== undefined) syncHistory(incomingHistory)
     const cwd = normalizeCwd(rawCwd)
     const bucket = reviewerBucketOf(cwd)
+    // 评审桶同理：同一目录只允许一个在途评审，否则完成结果无法归属到具体 taskId。
+    const activeReview = tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
+    if (activeReview !== undefined) {
+      return rejectBusy({
+        kind: 'review', instruction: '(review rejected: channel busy)', cwd, lane: '@review', bucketKey: bucket.key,
+        target: { kind: 'worker', cwd, lane: '@review' },
+        originThreadId,
+        activeTaskId: activeReview.taskId,
+        reason: 'reviewer-bucket-busy',
+        error: 'another review (' + activeReview.taskId + ') is still active for this directory; refusing to start a second one — its completion could not be attributed to a specific task. Wait for it to finish.',
+      })
+    }
     const instruction = ['【变更 diff】\n' + (typeof diff === 'string' && diff.trim() !== '' ? diff.slice(0, 60000) : '(未提供 diff)'), '【审查重点】\n' + (typeof focus === 'string' && focus.trim() !== '' ? focus.slice(0, 4000) : '(未指定,请按一般标准审查)')].join('\n\n')
     const task = { taskId: uid(), kind: 'review', instruction, cwd, lane: '@review', bucketKey: bucket.key, target: { kind: 'worker', cwd, lane: '@review' }, status: 'accepted', time: Date.now(), result: undefined, error: undefined }
-    tasks.push(task)
-    if (tasks.length > 200) tasks.splice(0, tasks.length - 200)
+    rememberTask(tasks, task)
+    // 评审同样产生 taskId，因此同样支持来源关联；绑定失败不派活。
+    const bound = bindAssociation(task, originThreadId)
+    if (!bound.ok) {
+      task.status = 'error'
+      task.error = bound.message
+      task.reason = bound.reason
+      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, cwd, kind: 'review' })
+      return task
+    }
     try {
       const delivered = await deliver(bucket, instruction, REVIEWER_BRIEF(cwd), '[评审请求] ')
       if (delivered.fallback) {
@@ -744,6 +1039,7 @@ export async function apply(ctx) {
         task.fallback = delivered.fallbackNote
         remember('user', '[评审请求] ' + (typeof focus === 'string' && focus !== '' ? focus : 'diff 审查'))
         remember('assistant', task.result)
+        persistTask(task)
         pushTask(task.taskId, 'result', { text: task.result, stopReason: delivered.stopReason, childId: null, cwd, kind: 'review' })
       } else {
         bucket.activeSince = Date.now()
@@ -752,6 +1048,7 @@ export async function apply(ctx) {
     } catch (e) {
       task.status = 'error'
       task.error = errText(e)
+      persistTask(task)
       pushTask(task.taskId, 'error', { error: task.error, cwd, kind: 'review' })
     }
     return task
@@ -782,6 +1079,7 @@ export async function apply(ctx) {
       if (active !== undefined && total.length > 0) {
         active.status = 'done'
         active.result = total.slice(Math.max(0, total.length - 4000)).trim() || '(无输出)'
+        persistTask(active)
         pushTask(active.taskId, 'result', { text: active.result, stopReason: 'quiet-timeout', childId: bucket.childId, cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
         bucket.activeSince = 0
       }
@@ -795,6 +1093,41 @@ export async function apply(ctx) {
       if (task === undefined) { settleSessionTask(record, 'cancelled', {}); continue }
       if (task.status === 'cancelled') { record.settled = true; if (record.abort !== undefined) { try { record.abort.abort() } catch (e) { /* ignore */ } } sessionTargets.delete(record.sessionId); continue }
       const now = Date.now()
+      // 精确关联模式：轮询/读日志只是观察机会，收尾只能由"自己那个 turn 的 turn/end"触发。
+      if (record.precise === true) {
+        await observeSessionLog(record)
+        if (record.settled) continue
+        if (record.tracker.end !== undefined) { settleFromTracker(record); continue }
+        if (record.watcher !== 'follow') pushPreciseProgress(record)
+        if (!record.sawRunning && now - record.startedAt > SESSION_DISPATCH_TIMEOUT_MS && record.delivered === true && record.queuedNoted !== true) {
+          record.queuedNoted = true
+          pushTask(record.taskId, 'note', {
+            note: 'QUEUED',
+            text: 'prompt 已被接受并进入该会话队列，等它空闲时会跑；不要重发',
+            target: { kind: 'session', sessionId: record.sessionId },
+            delivered: true,
+          })
+        }
+        if (!record.sawRunning && now - record.startedAt > SESSION_DISPATCH_TIMEOUT_MS && record.delivered !== true) {
+          settleSessionTask(record, 'error', { error: 'the session never accepted the prompt', reason: REASONS.NOT_ACCEPTED, delivered: false })
+          continue
+        }
+        // quiet / 总预算到期但**没有**自己 turn 的结束证据：只能报未确认（resend:false），绝不猜 done。
+        const quietExpired = record.sawRunning && record.activeSince > 0 && now - record.activeSince > SESSION_QUIET_TIMEOUT_MS
+        const budgetExpired = now - record.startedAt > SESSION_TOTAL_TIMEOUT_MS
+        if (quietExpired || budgetExpired) {
+          settleSessionTask(record, 'unknown', {
+            error: record.delivered === true
+              ? 'prompt 已投递进该会话队列，但没有观察到本请求自己那个 turn 的结束（可能仍在排队/仍在跑/已被别的回合掩盖）；执行状态未确认，不要重发'
+              : 'the session never accepted the prompt within the budget',
+            reason: REASONS.UNCONFIRMED,
+            resend: false,
+            note: 'execution state unconfirmed: no turn/end matching this request\'s requestId was observed',
+            ...(record.delivered === true ? { delivered: true } : {}),
+          })
+        }
+        continue
+      }
       if (record.watcher === 'poll' && sessionQuery !== undefined) {
         try {
           const snap = await sessionQuery.readSession(record.sessionId)
@@ -917,6 +1250,12 @@ export async function apply(ctx) {
       if (!dryRun && instruction.trim() === '') { sendJson(res, 400, { error: 'missing instruction' }); return }
       const classified = classifyTarget(parsed)
       if (!classified.ok) { sendJson(res, 400, { error: classified.message, reason: classified.reason }); return }
+      // 来源关联（R1）：非法值在**外部执行前**拒绝；dryRun 不写任何关联。
+      const origin = originOf(parsed)
+      if (!origin.ok) {
+        sendJson(res, 400, { error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', reason: ASSOC_REASONS.INVALID_ORIGIN })
+        return
+      }
       // dryRun：只解析目标、回显它，**不投递任何东西**。存在的意义是让"我这条查询会命中
       // 哪条会话"能纯只读地问出来——真实事故里调用方就是因为没法先验证，才发了一条占位
       // 消息去探测，结果污染了用户会话。
@@ -956,11 +1295,12 @@ export async function apply(ctx) {
         })
         return
       }
-      const task = await enqueue(instruction, parsed.history, classified.target, parsed.model, 'task', classified.deliver, classified.notes)
+      const task = await enqueue(instruction, parsed.history, classified.target, parsed.model, 'task', classified.deliver, classified.notes, origin.originThreadId)
       if (task.status === 'error') {
         sendJson(res, 400, {
           error: task.error,
           reason: task.reason,
+          ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }),
           ...(task.delivered === true ? { delivered: true } : {}),
           ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
         })
@@ -1068,8 +1408,17 @@ export async function apply(ctx) {
       if (req.method !== 'POST') { res.writeHead(405); res.end('POST only'); return }
       const parsed = await readJsonBody(req, res)
       if (parsed === null) return
-      const task = await submitReview(parsed.cwd, parsed.diff, parsed.focus, parsed.history)
-      sendJson(res, 202, { taskId: task.taskId, status: task.status, cwd: task.cwd, kind: 'review' })
+      const origin = originOf(parsed)
+      if (!origin.ok) {
+        sendJson(res, 400, { error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', reason: ASSOC_REASONS.INVALID_ORIGIN })
+        return
+      }
+      const task = await submitReview(parsed.cwd, parsed.diff, parsed.focus, parsed.history, origin.originThreadId)
+      if (task.status === 'error') {
+        sendJson(res, 400, { error: task.error, reason: task.reason, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) })
+        return
+      }
+      sendJson(res, 202, { taskId: task.taskId, status: task.status, cwd: task.cwd, kind: 'review', ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) })
     },
   }))
 
@@ -1078,7 +1427,31 @@ export async function apply(ctx) {
     path: '/api/dsh-bridge/tasks',
     handler: async (req, res) => {
       if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
-      sendJson(res, 200, { tasks: tasks.slice(-50).map((t) => ({ taskId: t.taskId, kind: t.kind, cwd: t.cwd, lane: t.lane, target: t.target, deliver: t.deliver, status: t.status, time: t.time, instruction: t.instruction.slice(0, 200), error: t.error, reason: t.reason, fallback: t.fallback })) })
+      const qs = qsOf(req)
+      const origin = originOf(qs)
+      if (!origin.ok) {
+        sendJson(res, 400, { error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', reason: ASSOC_REASONS.INVALID_ORIGIN })
+        return
+      }
+      const projection = (t) => ({ taskId: t.taskId, kind: t.kind, cwd: t.cwd, lane: t.lane, target: t.target, deliver: t.deliver, status: t.status, time: t.time, instruction: t.instruction.slice(0, 200), error: t.error, reason: t.reason, fallback: t.fallback, ...(t.originThreadId === undefined ? {} : { originThreadId: t.originThreadId }) })
+      // 带 originThreadId：跨回合按来源找任务（含只存在于持久记录里的历史任务）。
+      if (origin.originThreadId !== undefined) {
+        const live = tasks.filter((t) => t.originThreadId === origin.originThreadId)
+        const liveIds = new Set(live.map((t) => t.taskId))
+        const listed = associations === null ? { ok: false, reason: 'association-store-unavailable' } : associations.byOrigin(origin.originThreadId)
+        if (listed.ok !== true) {
+          sendJson(res, 503, { error: 'task association store is unavailable in this gateway', reason: listed.reason })
+          return
+        }
+        const byId = new Map(listed.tasks.map((r) => [r.taskId, r]))
+        const merged = [
+          ...live.map((t) => ({ ...projectStoredTask(byId.get(t.taskId) === undefined ? { taskId: t.taskId, originThreadId: t.originThreadId, kind: t.kind, target: t.target, status: t.status, createdAt: t.time, updatedAt: t.time } : byId.get(t.taskId)), instruction: t.instruction.slice(0, 200), live: true })),
+          ...listed.tasks.filter((r) => !liveIds.has(r.taskId)).map((r) => projectStoredTask(r)),
+        ]
+        sendJson(res, 200, { originThreadId: origin.originThreadId, count: merged.length, tasks: merged, recovered: listed.tasks.some((r) => !liveIds.has(r.taskId)), live: live.length, capabilities: capabilityReport() })
+        return
+      }
+      sendJson(res, 200, { tasks: tasks.slice(-50).map(projection), capabilities: capabilityReport() })
     },
   }))
 
@@ -1091,9 +1464,29 @@ export async function apply(ctx) {
       if (parsed === null) return
       const taskId = parsed && parsed.taskId
       if (typeof taskId !== 'string' || taskId === '') { sendJson(res, 400, { error: 'missing taskId' }); return }
+      const origin = originOf(parsed)
+      if (!origin.ok) {
+        sendJson(res, 400, { error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', reason: ASSOC_REASONS.INVALID_ORIGIN })
+        return
+      }
       const task = tasks.find((t) => t.taskId === taskId)
       if (task === undefined) { sendJson(res, 404, { error: 'unknown taskId' }); return }
-      if (task.status !== 'accepted' && task.status !== 'running') { sendJson(res, 200, { taskId, cancelled: false, status: task.status }); return }
+      // 已关联的任务：缺来源/错来源都拒绝（同一个入口规则与 /status 一致）。
+      if (task.originThreadId !== undefined) {
+        if (origin.originThreadId === undefined) {
+          sendJson(res, 404, {
+            error: 'task ' + taskId + ' is bound to a source conversation; pass originThreadId to cancel it',
+            reason: ASSOC_REASONS.MISSING_ORIGIN,
+            hint: 'pass originThreadId (the Codex conversation that dispatched this task)',
+          })
+          return
+        }
+        if (task.originThreadId !== origin.originThreadId) {
+          sendJson(res, 404, { error: 'task ' + taskId + ' is bound to another origin', reason: ASSOC_REASONS.ORIGIN_MISMATCH })
+          return
+        }
+      }
+      if (task.status !== 'accepted' && task.status !== 'running') { sendJson(res, 200, { taskId, cancelled: false, status: task.status, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) }); return }
 
       // session 目标动的是用户自己的对话：取消会打断他正在跑的回合，因此必须显式 force。
       if (task.target !== undefined && task.target.kind === 'session') {
@@ -1119,8 +1512,9 @@ export async function apply(ctx) {
         task.cancelReason = 'cancelled by request (force)'
         const record = sessionTargets.get(task.target.sessionId)
         if (record !== undefined) settleSessionTask(record, 'cancelled', {})
+        persistTask(task)
         pushTask(taskId, 'cancelled', { target: { kind: 'session', sessionId: task.target.sessionId } })
-        sendJson(res, 200, { taskId, cancelled: true, interrupted: cancelled, target: task.target })
+        sendJson(res, 200, { taskId, cancelled: true, interrupted: cancelled, target: task.target, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) })
         return
       }
 
@@ -1136,8 +1530,9 @@ export async function apply(ctx) {
       } catch (e) {
         console.error('[dsh-bridge] cancel interrupt failed:', errText(e).slice(0, 200))
       }
+      persistTask(task)
       pushTask(taskId, 'cancelled', { cwd: task.cwd })
-      sendJson(res, 200, { taskId, cancelled: true, interrupted })
+      sendJson(res, 200, { taskId, cancelled: true, interrupted, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) })
     },
   }))
 
@@ -1147,20 +1542,112 @@ export async function apply(ctx) {
     handler: async (req, res) => {
       if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
       const qs = qsOf(req)
+      const origin = originOf(qs)
+      if (!origin.ok) {
+        sendJson(res, 400, { error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', reason: ASSOC_REASONS.INVALID_ORIGIN })
+        return
+      }
       const taskId = qs.taskId
       if (taskId !== undefined && taskId !== '') {
         const task = tasks.find((t) => t.taskId === taskId)
-        if (task === undefined) { sendJson(res, 404, { error: 'unknown taskId' }); return }
-        const record = task.target !== undefined && task.target.kind === 'session' ? sessionTargets.get(task.target.sessionId) : undefined
+        if (task !== undefined) {
+          // 已关联的任务：缺来源 → origin-required；错来源 → origin-mismatch。两条都**不返回结果**。
+          // 只有旧的"未关联"任务才继续支持只按 taskId 查询（兼容）。
+          if (task.originThreadId !== undefined) {
+            if (origin.originThreadId === undefined) {
+              sendJson(res, 404, {
+                error: 'task ' + taskId + ' is bound to a source conversation; pass originThreadId to read it',
+                reason: ASSOC_REASONS.MISSING_ORIGIN,
+                hint: 'pass originThreadId (the Codex conversation that dispatched this task)',
+              })
+              return
+            }
+            if (task.originThreadId !== origin.originThreadId) {
+              sendJson(res, 404, { error: 'task ' + taskId + ' is bound to another origin', reason: ASSOC_REASONS.ORIGIN_MISMATCH })
+              return
+            }
+          }
+          const record = task.target !== undefined && task.target.kind === 'session' ? sessionTargets.get(task.target.sessionId) : undefined
+          sendJson(res, 200, {
+            taskId: task.taskId, status: task.status, kind: task.kind, cwd: task.cwd, lane: task.lane,
+            target: task.target, deliver: task.deliver, instruction: task.instruction.slice(0, 300),
+            result: task.result, error: task.error, reason: task.reason, fallback: task.fallback,
+            // delivered=true 表示 prompt 已被会话接受（进了队列）——即便后面报错也不要重发。
+            ...(task.delivered === undefined ? {} : { delivered: task.delivered }),
+            ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }),
+            ...(task.requestId === undefined ? {} : { requestId: task.requestId }),
+            ...(task.dshTurn === undefined ? {} : { dshTurn: task.dshTurn }),
+            ...(task.turnEndKind === undefined ? {} : { turnEndKind: task.turnEndKind }),
+            ...(task.partialResult === undefined ? {} : { partialResult: task.partialResult }),
+            ...(task.resend === undefined ? {} : { resend: task.resend }),
+            ...(task.note === undefined ? {} : { note: task.note }),
+            ...(task.associationError === undefined ? {} : { associationError: task.associationError }),
+            ...(task.matchedBy === undefined ? {} : { matchedBy: task.matchedBy }),
+            ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
+            ...(record === undefined ? {} : { watcher: record.watcher, sawRunning: record.sawRunning }),
+          })
+          return
+        }
+
+        // 内存里没有（网关重载/新实例）：从持久关联记录恢复。
+        const stored = associations === null
+          ? { ok: false, reason: 'association-store-unavailable' }
+          : associations.fetch({ originThreadId: origin.originThreadId, taskId })
+        if (stored.ok !== true) {
+          const hint = stored.reason === ASSOC_REASONS.MISSING_ORIGIN
+            ? 'pass originThreadId to recover a persisted task result'
+            : (stored.reason === ASSOC_REASONS.ORIGIN_MISMATCH ? 'this task is bound to another origin' : undefined)
+          sendJson(res, 404, {
+            error: stored.reason === ASSOC_REASONS.UNKNOWN_TASK ? 'unknown taskId' : 'cannot recover task ' + taskId,
+            reason: stored.reason,
+            ...(hint === undefined ? {} : { hint }),
+          })
+          return
+        }
+        const record = stored.record
+        const terminal = record.status === 'done' || record.status === 'error' || record.status === 'cancelled'
         sendJson(res, 200, {
-          taskId: task.taskId, status: task.status, kind: task.kind, cwd: task.cwd, lane: task.lane,
-          target: task.target, deliver: task.deliver, instruction: task.instruction.slice(0, 300),
-          result: task.result, error: task.error, reason: task.reason, fallback: task.fallback,
-          // delivered=true 表示 prompt 已被会话接受（进了队列）——即便后面报错也不要重发。
-          ...(task.delivered === undefined ? {} : { delivered: task.delivered }),
-          ...(task.matchedBy === undefined ? {} : { matchedBy: task.matchedBy }),
-          ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
-          ...(record === undefined ? {} : { watcher: record.watcher, sawRunning: record.sawRunning }),
+          taskId: record.taskId,
+          originThreadId: record.originThreadId,
+          kind: record.kind,
+          target: record.target,
+          ...(record.profile === undefined ? {} : { profile: record.profile }),
+          // 非终态记录：**不谎报已完成**，也不重新观察（未实现），明确标未知并禁止重发。
+          status: terminal ? record.status : 'unknown',
+          persistedStatus: record.status,
+          recovered: true,
+          ...(terminal
+            ? {}
+            : {
+                reason: 'execution-state-unconfirmed',
+                note: '这条任务在执行/交付未确认前就失去了运行时上下文（网关重载或新实例）；不重发、不重新观察。原目标见 target。',
+                resend: false,
+              }),
+          ...(record.delivered === undefined ? {} : { delivered: record.delivered }),
+          ...(record.requestId === undefined ? {} : { requestId: record.requestId }),
+          ...(record.dshTurn === undefined ? {} : { dshTurn: record.dshTurn }),
+          ...(record.result === undefined ? {} : { result: record.result }),
+          ...(record.error === undefined ? {} : { error: record.error }),
+          ...(record.stopReason === undefined ? {} : { stopReason: record.stopReason }),
+          createdAt: record.createdAt,
+          updatedAt: record.updatedAt,
+        })
+        return
+      }
+
+      // 没有 taskId：只给来源时列出该来源登记过的任务，用来找回丢失的 taskId。
+      if (origin.originThreadId !== undefined) {
+        const listed = associations === null ? { ok: false, reason: 'association-store-unavailable' } : associations.byOrigin(origin.originThreadId)
+        if (listed.ok !== true) {
+          sendJson(res, 503, { error: 'task association store is unavailable in this gateway', reason: listed.reason })
+          return
+        }
+        const liveIds = new Set(tasks.filter((t) => t.originThreadId === origin.originThreadId).map((t) => t.taskId))
+        sendJson(res, 200, {
+          originThreadId: origin.originThreadId,
+          count: listed.tasks.length,
+          // 与精确查询同一套语义：本实例没有运行上下文的非终态记录只能标 unknown（绝不谎报还在观察）。
+          tasks: listed.tasks.map((r) => ({ ...projectStoredTask(r), live: liveIds.has(r.taskId) })),
         })
         return
       }
@@ -1171,6 +1658,7 @@ export async function apply(ctx) {
         reviewers: Array.from(reviewerBuckets.keys()),
         sessions: Array.from(sessionTargets.keys()),
         sessionController: sessionControllerNow() !== undefined,
+        capabilities: capabilityReport(),
         tasks: tasks.slice(-20).map((t) => ({ taskId: t.taskId, kind: t.kind, status: t.status, cwd: t.cwd, lane: t.lane, target: t.target, deliver: t.deliver })),
       })
     },
@@ -1189,6 +1677,7 @@ export async function apply(ctx) {
         sessionController: probe('sessionController'),
         services: Object.fromEntries(['sessionController', 'connection', 'sessionQuery', 'sessionPersistence', 'workspaceRegistry', 'agents', 'subagents', 'agentPresets', 'timer', 'llm'].map((n) => [n, probe(n)])),
         sessionTargets: [], models: knownModels, modelProvider, modelListError, workspaces: [],
+        capabilities: capabilityReport(),
       }
       out.pending = tasks.filter((t) => t.status === 'accepted' || t.status === 'running').length
       try { out.providers = subagents.list() } catch (e) { out.providers = ['list failed: ' + errText(e)] }
@@ -1237,13 +1726,21 @@ export async function apply(ctx) {
                 try { socket.write(JSON.stringify({ type: 'pong', time: Date.now() }) + '\n') } catch (e) {}
               } else if (msg.type === 'instruction' && typeof msg.text === 'string' && msg.text.trim() !== '') {
                 const classified = classifyTarget(msg)
-                if (!classified.ok) {
-                  try { socket.write(JSON.stringify({ type: 'error', reason: classified.reason, error: classified.message, time: Date.now() }) + '\n') } catch (e) { /* drop */ }
+                const origin = originOf(msg)
+                if (!classified.ok || !origin.ok) {
+                  const reason = classified.ok ? ASSOC_REASONS.INVALID_ORIGIN : classified.reason
+                  const error = classified.ok ? 'originThreadId must be a non-empty string (<= 200 chars, no control characters)' : classified.message
+                  try { socket.write(JSON.stringify({ type: 'error', reason, error, time: Date.now() }) + '\n') } catch (e) { /* drop */ }
                 } else {
-                  void enqueue(msg.text, msg.history, classified.target, msg.model, 'task', classified.deliver, classified.notes)
+                  void enqueue(msg.text, msg.history, classified.target, msg.model, 'task', classified.deliver, classified.notes, origin.originThreadId)
                 }
               } else if (msg.type === 'review') {
-                void submitReview(msg.cwd, msg.diff, msg.focus, msg.history)
+                const origin = originOf(msg)
+                if (!origin.ok) {
+                  try { socket.write(JSON.stringify({ type: 'error', reason: ASSOC_REASONS.INVALID_ORIGIN, error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', time: Date.now() }) + '\n') } catch (e) { /* drop */ }
+                } else {
+                  void submitReview(msg.cwd, msg.diff, msg.focus, msg.history, origin.originThreadId)
+                }
               }
             }
           }
@@ -1272,12 +1769,15 @@ export async function apply(ctx) {
       sessionQuery: { type: 'string', description: '按标题/内容搜索已有会话(唯一命中才生效,多条或落空会返回候选)。' },
       deliver: { type: 'string', description: "投递方式: queue(默认,排队) 或 steer(插入当前回合)。" },
       dryRun: { type: 'boolean', description: '为 true 时只解析目标并回显(含 matchedBy 与候选),不投递任何消息——验证命中用它。' },
+      originThreadId: { type: 'string', description: '发起本任务的 Codex 对话 id(来源关联)。必须是显式传入的非空字符串——不要用常驻进程环境或"最近对话"推断。用于之后按 origin+taskId 精确收取结果。' },
       wait: { type: 'boolean', description: '为 true 时等待结果(最长 15 分钟)。' },
     },
     output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
     async execute(args) {
       const classified = classifyTarget(args)
       if (!classified.ok) return { ok: false, reason: classified.reason, error: classified.message }
+      const origin = originOf(args)
+      if (!origin.ok) return { ok: false, reason: ASSOC_REASONS.INVALID_ORIGIN, error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)' }
       // dryRun：只解析目标、回显，不投递。给调用方一条"先验证命中"的正路，免得它发消息试探。
       if (args.dryRun === true) {
         if (classified.target.kind === 'session') {
@@ -1298,7 +1798,7 @@ export async function apply(ctx) {
         const lane = normalizeLane(classified.target.lane)
         return { ok: true, dryRun: true, resolved: true, target: { kind: 'worker', cwd, lane }, note: '只解析目标，未派活' }
       }
-      const task = await enqueue(args.instruction, undefined, classified.target, args.model, 'task', classified.deliver, classified.notes)
+      const task = await enqueue(args.instruction, undefined, classified.target, args.model, 'task', classified.deliver, classified.notes, origin.originThreadId)
       if (task.status === 'error') {
         return { ok: false, taskId: task.taskId, reason: task.reason, error: task.error, ...(task.delivered === true ? { delivered: true } : {}), ...(task.candidates === undefined ? {} : { candidates: task.candidates }) }
       }
@@ -1322,13 +1822,16 @@ export async function apply(ctx) {
       cwd: { type: 'string', required: true, description: '评审目标所在工作目录。' },
       diff: { type: 'string', description: '变更 diff 文本(git diff 输出)。' },
       focus: { type: 'string', description: '审查重点。' },
+      originThreadId: { type: 'string', description: '发起本次评审的 Codex 对话 id(来源关联)。必须显式传入；评审同样产生 taskId，因此同样支持按 origin+taskId 收取。' },
       wait: { type: 'boolean', description: '为 true 时等待评审结果(最长 15 分钟)。' },
     },
     output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
     async execute(args) {
-      const task = await submitReview(args.cwd, args.diff, args.focus, undefined)
+      const origin = originOf(args)
+      if (!origin.ok) return { ok: false, reason: ASSOC_REASONS.INVALID_ORIGIN, error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)' }
+      const task = await submitReview(args.cwd, args.diff, args.focus, undefined, origin.originThreadId)
       if (args.wait !== true || timer === undefined) {
-        return { taskId: task.taskId, status: task.status, cwd: task.cwd }
+        return { taskId: task.taskId, status: task.status, cwd: task.cwd, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) }
       }
       const t0 = Date.now()
       while (task.status === 'accepted' || task.status === 'running') {

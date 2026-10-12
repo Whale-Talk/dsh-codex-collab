@@ -204,11 +204,11 @@ tunnel-client run --profile dsh
 ```jsonc
 // 1) 找到会话（只读）
 dsh_sessions({ "query": "按文档启动OKX策略实验计划" })
-// → { "items": [{ "sessionId": "session-8d481ad9-…", "snippet": "按文档启动OKX策略实验计划",
+// → { "items": [{ "sessionId": "session-example-…", "snippet": "按文档启动OKX策略实验计划",
 //                 "agentAvailable": true }], "matchedBy": "list" }
 
 // 2) 投递进那条会话
-dsh_task({ "instruction": "继续推进第 3 步…", "sessionId": "session-8d481ad9-…" })
+dsh_task({ "instruction": "继续推进第 3 步…", "sessionId": "session-example-…" })
 // deliver 可选 "queue"（默认，排队）或 "steer"（插入当前回合）
 ```
 
@@ -233,7 +233,7 @@ dsh-task --list | --status <taskId> | --cancel <taskId> [--force]
 ```bash
 # 1) 找到（只读，不创建任何东西）
 dsh-task --sessions "按文档启动OKX策略实验计划"
-# → {"items":[{"sessionId":"session-8d481ad9-…","snippet":"按文档启动OKX策略实验计划",
+# → {"items":[{"sessionId":"session-example-…","snippet":"按文档启动OKX策略实验计划",
 #              "agentAvailable":true}],"total":1,"matchedBy":"list"}
 
 # 1b) 没命中时会给近似候选（按标题相似度 + 最近更新排序），换词重查或改用 sessionId——
@@ -243,7 +243,7 @@ dsh-task --dry-run --find "量化框架"
 #    "candidates":[{"sessionId":"1c0f99f8-…","snippet":"你是一个量化研究项目的技术","score":0.333}, …]}
 
 # 2) 接通（投递进那条会话；这一轮的助手回复作为汇报返回，只回报本轮新增文本）
-dsh-task --in "<继续推进的指令>" --session "session-8d481ad9-…"
+dsh-task --in "<继续推进的指令>" --session "session-example-…"
 ```
 
 `matchedBy` 说明"找到"走了哪条路：`search` = 会话搜索索引；`list` = 索引被部署禁用时退回遍历列表 + 标题投影（都不激活 Agent）。
@@ -304,6 +304,91 @@ codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
 
 > 注意：插件自带的 `dsh_collab_send` / `dsh_collab_review` 是 **DSH 侧入口**，只回到同一个网关，**不经过 Codex**。要"叫 Codex 干活"用上面 A/B；要"让 Codex 那条对话继续"，只能等 Codex 自己下一轮（`dsh_task --wait` 或 `dsh_task_status`）。
 
+## DSH → Codex 收件箱（桌面自动唤醒：blocked）
+
+目标形态是"DSH 主动往 Codex Desktop 正在用的那条聊天发一条消息，并让它开始处理"。**M0 实测本机做不到**：桌面 app-server 以默认 `stdio://` 启动、端点归 `ChatGPT.exe` 私有，既没有 `--listen` 出的 ws/TCP 端点，也没有文档所说的 app-server 控制套接字——详见 [`docs/codex-desktop-attachment-evidence.md`](docs/codex-desktop-attachment-evidence.md)。
+
+因此先交付可独立验证的一半（用法见 [`docs/DSH_TO_CODEX_INBOX.md`](docs/DSH_TO_CODEX_INBOX.md)）：
+
+```bash
+node mcp/codex-desktop-probe.mjs --schema        # 只读能力探针：还要不要继续谈唤醒，看它
+node mcp/codex-inbox.mjs capabilities            # 能力如实上报：deliveryMode=inbox, canWakeIdle=false
+node mcp/codex-inbox.mjs bind --binding <id> --thread <codexThreadId> [--source <DSH会话id>]
+node mcp/codex-inbox.mjs send --binding <id> --text "<正文>" [--key <幂等键>]
+node mcp/codex-inbox.mjs pending                 # Codex 侧/用户主动来读
+```
+
+- 收件箱：追加型事件日志 + **单把独占写锁**（幂等检查 / seq 分配 / 绑定更新 / 追加都在锁内）。
+  锁是 `<root>/.write.lock` 这个共享路径上的**一次原子独占创建**（硬链接发布 / `wx`），谁创建成功谁进临界区；
+  **在线竞争期间绝不自动回收**（"检查共享路径再删除"无法原子化，会删掉别人刚建的新锁）。
+  持有者活着 → 有限等待后 `lock-timeout`；持有者已死 → **二次确认**后 `lock-stale-holder`；元数据不可确认 → `lock-unverified-holder`；
+  后两者都是**可恢复错误 + 人工清理**（文档给了步骤），宁可阻塞也不冒双写者风险。
+  追加前修复**记录边界**，残尾不会吞掉后续写入；状态机 `queued → delivered → acked`（另有 `failed` / `delivery-unknown`）；
+  存储损坏明确报错，不伪装成空收件箱。
+- **未绑定一律拒绝**，不猜目标、不从最近使用里挑默认；授权线程 ID 只存在于本地绑定，不作为发布默认值。
+- CLI 参数严格：带值旗标缺值或未知旗标一律 exit 2，且在打开存储之前拒绝。
+- 明确不宣称：**自动唤醒、观察回合事件均未实现**；死持有者需人工清理（非自动恢复）、断电级持久性、
+  跨机（网络文件系统）锁语义均未验证/不自动（见用法文档 §4）。
+- 现有六个 MCP 工具与 `dsh_collab_send` 语义未改动。
+
+验证：`node test/codex-outbox.test.mjs`（24 项，含真多进程并发、6 进程压测、活持有者期间零写入）、
+`node test/codex-inbox-cli.test.mjs`（6 项）、`node test/codex-desktop-probe.test.mjs`（11 项，含采集层失败判定）、
+`node mcp/codex-desktop-probe.mjs --schema`（现场能力报告）。
+
+## 来源关联：Codex 对话 → 任务 → 结果（跨回合精确收取）
+
+"本来就是 Codex 驱使 DSH 派活"这件事现在有**显式身份**了：派活时带上发起对话 id（`originThreadId`），
+网关在**执行前**把「来源对话 → taskId → 执行目标」持久落盘；之后任何回合（哪怕是新的 MCP 进程、网关重载后的新实例）
+都能按 `originThreadId + taskId` 精确取回这次任务的结果。详见 [`docs/CODEX_DSH_TASK_REPLY_PLAN.md`](docs/CODEX_DSH_TASK_REPLY_PLAN.md)。
+
+```bash
+# 派活（MCP 工具 dsh_task / dsh_review 的 originThreadId 参数同理，必须显式传当前对话 id）
+dsh-task --in "<指令>" --cwd "<目录>" --origin "<当前 Codex 对话 id>"
+
+# 下一个回合：只凭来源找回 taskId，再精确取结果
+dsh-task --my-tasks --origin "<当前 Codex 对话 id>"
+dsh-task --status "<taskId>" --origin "<当前 Codex 对话 id>"
+```
+
+- **持久关联记录**：`{originThreadId, taskId, target, status, createdAt, updatedAt, delivered, result/error}`，
+  追加型 JSONL + 与收件箱**同一套独占写锁**；位置在用户数据目录 `~/.dsh-codex-task-assoc/<namespace>/bindings.jsonl`
+  （`DSH_CODEX_TASK_ASSOC_DIR` / `DSH_BRIDGE_ASSOC_NAMESPACE` 可覆盖；**测试全部用临时 root，绝不默认写仓库**）。
+  namespace 是**校验过的短标识**且 origin/taskId 从不参与路径拼接；日志追加 + taskId 全局唯一 ⇒ 多个网关不会互相覆盖记录。
+- **绑定不可改投**：同一 taskId 换来源直接拒绝；`originThreadId` 必须是合法非空字符串——**字段未传**才是旧的无关联模式，
+  显式给空串 / null / 纯空白 / 非字符串一律在执行前拒绝（`invalid-origin`），绝不静默回落或改用环境变量。
+- **执行前落盘**：首次持久绑定失败就**不启动 DSH 执行**（绝不出现"执行了却没绑定"）；终态/失败/取消/交付确认都写回。
+- **派活前只读核验网关能力**：`/status`、`/tasks`、`/debug` 上报 `capabilities.originBinding.supported`；
+  MCP/CLI 带来源时必须先确认它为 true（**不靠包版本猜**）——旧网关会忽略 `originThreadId` 却照常返回 accepted，
+  从而产生未绑定任务，所以不支持时**零执行拒绝**。旧的无来源调用完全兼容。
+- **会话任务的结果归属**（带来源时）：不能再用"派发前基线 + 全会话 idle"（那会把别的请求的输出算给当前 taskId）。
+  改用 `prompt.requestId`（=taskId）→ DSH 的 `user/message.source.rpcId` → 按 `seq` 有序跟踪未闭合回合 → 只收**自己那个 turn** 的助手文本，
+  并且**只有该 turn 的 `turn/end.reason.kind === 'completed'` 才算成功**（其余 aborted/blocked/error/max-tokens/interrupted/forked 是明确失败，
+  部分文字放 `partialResult`）。follow 开场的 `snapshot.records` 也会被检查（快任务可能已经跑完）；`api-session/status` 只当作"读一次日志的机会"，
+  **不是**完成证明。落盘并回显（内存分支与恢复分支都给）：`requestId`（=taskId）与匹配到的 `dshTurn`；
+  `turnEndKind`/`partialResult` 以及未确认时的 `resend`/`note` **只在活任务的内存响应里**出现（不在持久记录里；
+  重启后非终态记录由恢复分支合成 `unknown` + `resend:false`）。
+- **带来源时拒绝 `steer`**（`origin-steer-unsupported`，执行前拒绝、零投递）：steer 会把一批请求合进同一个回合，无法为单个请求保证归属。
+- **没有证据就是未确认**：无匹配 `rpcId` 的终态、quiet/预算到期 → `status:"unknown"` + `resend:false`，绝不猜 done、绝不重发。
+- **网关必须回显并匹配 `originThreadId` 才算确认绑定/取值**：能力检查通过≠这次绑定成功（网关可能中途重载/旧 handler）。
+  未确认时 MCP/CLI 都按"未确认 + 禁止重发"上报（CLI 退出码 8），**不返回**那种响应里的结果。
+- **读结果必须匹配来源**：缺来源 → `origin-required`、错来源 → `origin-mismatch`（内存与重启后一致，`/cancel` 同样检查），
+  **绝不返回别的对话的结果**；只有真正未关联的旧任务保持"只给 taskId"兼容查询。
+- **同一通道（cwd+lane，评审=目录）同时只允许一个在途任务**：第二个明确 `worker-bucket-busy` / `reviewer-bucket-busy` 拒绝——
+  完成事件只能归属到通道里最老的那个任务，并发派活会让结果归属变成猜测。不同 lane/目录仍并行；上一任务结束后可继续复用同一子代理。
+- **恢复边界**：已完成结果在网关重载/新实例后仍能按 `origin+taskId` 取回；**没跑完**的任务（精确查询或只给来源列表）一律返回
+  `status: "unknown"` + `resend: false`（执行/交付状态未能确认，保留已知 `delivered` 与原目标），**不谎报完成、不自动重发、不去猜 DSH 最近助手文本**。
+  内存 200 条上限只淘汰**终态**任务（活任务永不被挤掉），持久记录不受影响。
+- 不按"最近/标题/时间"猜发起对话；`taskId` 是关联标识，**不是授权凭据**，也不等于线程 id。
+- **自动唤醒仍然 `false`**：来源关联解决的是"派活回报精确归属"，不是"唤醒空闲桌面聊天"。
+
+验证：`node test/codex-r1-contracts.test.mjs`（8 项：非法来源零执行、已关联任务缺/错来源拒绝、通道 busy、旧网关零执行拒绝、能力上报、
+能力通过但未确认来源 → 未确认+禁止重发、列表 unknown 语义、CLI 严格参数）、
+`node test/codex-session-correlation.test.mjs`（8 项：真实 SDK 字段的请求↔回合关联：排队请求忽略先前回合、只有自己 turn/end 才完成、
+error/blocked 不得 done、snapshot.records、重复投递不串文本、快照缺前半段回填、无匹配 rpcId → 未确认、steer 拒绝）、
+`node test/codex-association-e2e.test.mjs`（3 项：**真实 HTTP + 独立 MCP 进程 + 独立 CLI 进程** 的跨回合收取与重启恢复）、
+`node test/codex-associations.test.mjs`（13 项：存储/不可改投/来源校验/失败不泄漏 record/跨重启/命名空间隔离/真多进程并发/任务表淘汰）、
+`node test/dsh-bridge.test.mjs`（13 项：非法来源 400、执行前落盘、新实例恢复、200+ 记录、存储故障拒绝派活）。
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -315,6 +400,8 @@ codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
 | `DSH_BRIDGE_SESSION_DISPATCH_TIMEOUT_MS` | `120000` | 会话任务被接受后、迟迟没开始跑的容忍时间（仍在排队则报 `session-not-accepted`） |
 | `DSH_BRIDGE_SESSION_QUIET_TIMEOUT_MS` | `600000` | 见过 running 之后多久没有新助手文本算跑完 |
 | `DSH_BRIDGE_SESSION_TOTAL_TIMEOUT_MS` | `3600000` | 单个会话任务的总预算 |
+| `DSH_CODEX_TASK_ASSOC_DIR` | `~/.dsh-codex-task-assoc` | 任务关联记录的存储根（**默认只在用户目录，绝不写仓库**） |
+| `DSH_BRIDGE_ASSOC_NAMESPACE` | `default` | 关联记录的命名空间（`[A-Za-z0-9._-]{1,64}`）；多 profile 可各自一个来分隔存储 |
 
 ## 已知限制
 
@@ -326,7 +413,11 @@ codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
 - **冷会话可能接不上**：DSH 激活 Agent 需要会话投影（`Agent activation requires a projected Session observation`），未激活的会话会返回 `session-not-activatable`；归档会话的回合会以 `blocked` 收口（`session-archived`）
 - **评审不支持会话目标**：评审员必须与编码会话隔离，"独立评审"才成立
 - session 目标不使用 `cwd`/`lane`/`model`/`--commit`（会话自带这些语义），传了会被判 `invalid-target`
-- 网关重启会丢失内存中的任务表（含 session 观察器），这是既有设计
+- 网关重启会丢失内存中的任务表（含 session 观察器），这是既有设计；**但来源关联任务的终态结果在持久记录里**，重启后仍可按 `origin+taskId` 取回；没跑完的会明确返回 `unknown` + `resend:false`（不谎报、不重发）
+- 关联记录只对**显式带 `originThreadId`** 的派活生效；不带来源的旧任务是"无关联"的（只能按 taskId 查活在内存里的状态，查询到就返回 0，查不到退出码 6）
+- 恢复路径**不重新观察**已失去运行时上下文的活任务（未实现），因此这类任务只能得到 `unknown`；要去现实里确认就自己去看目标会话/工作目录——**不要重发**
+- **同一通道同时只允许一个在途任务**（含评审：同一目录一个）：第二个被 `worker-bucket-busy` / `reviewer-bucket-busy` 拒绝，避免完成结果被猜给错误的任务。这是为了保护结果归属，代价是"同 lane 快速连发"需要等前一条结束（或换 lane）
+- **MCP 侧用 `fetch` 调网关**：若网关端口落在 fetch 规范的禁用端口（`1/7/9/…/6000/6665-6669/6697/10080` 等），undici 会直接以 `bad port` 拒绝连接（表现为"网关在跑但 MCP 全部失败、且没有任何网关日志"）。默认端口（3080 / GUI 端口）不受影响；CLI 用 `node:http`，不受该限制。
 - **替换包内容不会热重载**：升级后必须重启 profile 进程，否则跑的还是旧 JS 模块（HMR 只重挂组合，不复用新代码）
 - **组合包被取消选中 = 插件完全不挂载**：此时所有 `/api/dsh-bridge/*` 都落到网关鉴权层返回 401（不是 404，容易误判成没装）
 - **DSH profile 的 pnpm 供应链冷却**：新发布的版本约 24 小时内会被 `minimumReleaseAge` 拒绝安装（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`）；管理器会把它写进 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 才放行。刚发版就装不上属正常，不是包的问题

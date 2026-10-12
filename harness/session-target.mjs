@@ -27,7 +27,17 @@ export const REASONS = {
   BAD_REQUEST: 'session-bad-request',
   GATEWAY_INTERNAL: 'session-gateway-internal',
   DISPATCH_FAILED: 'session-dispatch-failed',
+  /** 带来源的会话任务不能精确关联到单个请求回合：在执行前拒绝 steer。 */
+  ORIGIN_STEER_UNSUPPORTED: 'origin-steer-unsupported',
+  /** 关联到了请求回合，但该回合以非 completed 结束（aborted/blocked/error/…）。 */
+  TURN_FAILED: 'session-turn-failed',
+  /** 没有任何证据能确认这个请求回合的结局（不猜、不重发）。 */
+  UNCONFIRMED: 'execution-state-unconfirmed',
 }
+
+/** `turn/end` 的 reason.kind 枚举（来自 driver/typert）：**只有 completed 算成功**。 */
+export const TURN_END_KINDS = ['completed', 'aborted', 'blocked', 'error', 'max-tokens', 'interrupted', 'forked']
+export const SUCCESS_TURN_END = 'completed'
 
 /** 候选列表回传给调用方时的上限，避免把整个会话库倒出去。 */
 export const MAX_CANDIDATES = 10
@@ -89,6 +99,128 @@ export const pickSessionResult = (streamed, extracted) => {
   if (fromLog !== '') return fromLog
   const fromStream = typeof streamed === 'string' ? streamed.trim() : ''
   return fromStream !== '' ? fromStream : '(无输出)'
+}
+
+/**
+ * 请求 → DSH turn 的关联器（纯函数群）。
+ *
+ * 依据（本机 controller 0.2.0-rc.2 的实测字段）：
+ *  - `prompt.requestId` 会被写进 `user/message` 的 `event.data.source.rpcId`——这是"这条用户消息属于
+ *    哪次请求"的**唯一可靠凭据**（我们用 taskId 当 requestId）；
+ *  - **`user/message.data.turn` 不存在**：turn 号只能靠按 seq 有序跟踪"已 turn/start 但还没 turn/end"
+ *    的回合得到，遇到 rpcId 匹配的 user/message 时把它归到**当时仍未闭合**的那个 turn；
+ *  - `assistant/message.data = {turn, step, message:{content:[...]}}`：只收自己那个 turn 的助手文本；
+ *  - `turn/end.data = {turn, reason:{kind,…}}`：这是本次请求结束的依据；**只有 completed 算成功**；
+ *  - `api-session/status` 只表示 agent 当前是否 running（连续跑 queued turn 时可能没有新的 running=true），
+ *    因此它**绝不能**当作某个请求完成的证明。
+ *
+ * 同一套规则被 live follow 帧、follow 开场 snapshot.records、以及轮询读日志共用；`seq` 去重保证
+ * 同一条事件被多条路径投递时也只算一次、不串文本。
+ */
+export const createRequestTracker = (requestId) => ({
+  requestId: String(requestId),
+  /** 已 turn/start 但未 turn/end 的 turn 号（有序）。 */
+  openTurns: [],
+  /** 匹配到本请求的 turn 号（由 rpcId 匹配时那一刻的未闭合 turn 决定）。 */
+  turn: undefined,
+  sawRequest: false,
+  text: '',
+  /**
+   * **只记录"真正产生了效果"的事件 seq**（建立 turn 关联 / 追加自己 turn 的文字 / 收尾 / 记录 turn/start）。
+   * 当时因为"还不知道自己那个 turn"而无法使用的事件**不**标记——后续从完整日志回填时它们必须能被重新消费
+   * （否则快照缺前半段就会永久丢掉答案）。
+   */
+  usedSeqs: new Set(),
+  end: undefined,
+  lastSeq: 0,
+})
+
+const dataOf = (event) => (event.data !== undefined && event.data !== null && typeof event.data === 'object' ? event.data : {})
+
+/**
+ * 消费一条会话事件。返回 `'settled'`（本请求的 turn 已结束）/ `'progress'` / `'ignored'`。
+ */
+export const consumeSessionEvent = (tracker, event) => {
+  if (tracker === undefined || tracker === null) return 'ignored'
+  if (event === null || typeof event !== 'object') return 'ignored'
+  const seq = typeof event.seq === 'number' ? event.seq : undefined
+  if (seq !== undefined) {
+    if (tracker.usedSeqs.has(seq)) return 'ignored'          // 已经用过的效果不重复施加
+    tracker.lastSeq = Math.max(tracker.lastSeq, seq)
+  }
+  const markUsed = () => { if (seq !== undefined) tracker.usedSeqs.add(seq) }
+  const data = dataOf(event)
+  if (event.type === 'turn/start') {
+    const turn = typeof data.turn === 'number' ? data.turn : undefined
+    if (turn !== undefined && !tracker.openTurns.includes(turn)) tracker.openTurns.push(turn)
+    markUsed()
+    return 'ignored'
+  }
+  if (event.type === 'user/message') {
+    const source = data.source !== undefined && data.source !== null && typeof data.source === 'object' ? data.source : {}
+    if (typeof source.rpcId !== 'string' || source.rpcId !== tracker.requestId) return 'ignored'
+    tracker.sawRequest = true
+    if (tracker.turn === undefined) {
+      // user/message 没有 data.turn：归到此刻仍未闭合的那个 turn（有 data.turn 时以它为准）
+      const fallback = tracker.openTurns.length > 0 ? tracker.openTurns[tracker.openTurns.length - 1] : undefined
+      tracker.turn = typeof data.turn === 'number' ? data.turn : fallback
+    }
+    // 只有真的建立了 turn 关联才算"用过"；没有未闭合 turn 时留待回填。
+    if (tracker.turn !== undefined) markUsed()
+    return 'progress'
+  }
+  if (event.type === 'assistant/message') {
+    if (tracker.turn === undefined) return 'ignored'         // 还不知道自己的 turn：留待回填
+    if (typeof data.turn === 'number' && data.turn !== tracker.turn) return 'ignored'
+    const text = assistantTextOf(event)
+    if (text === '') return 'ignored'
+    tracker.text += text
+    markUsed()
+    return 'progress'
+  }
+  if (event.type === 'turn/end') {
+    const turn = typeof data.turn === 'number' ? data.turn : undefined
+    if (turn !== undefined) tracker.openTurns = tracker.openTurns.filter((t) => t !== turn)
+    if (tracker.turn === undefined || turn !== tracker.turn) {
+      // 不是我们的回合：**不标记**，等自己那个 turn 绑定后若还有对应结束仍要能收到。
+      return 'ignored'
+    }
+    const reason = data.reason !== undefined && data.reason !== null && typeof data.reason === 'object' ? data.reason : {}
+    const kind = typeof reason.kind === 'string' ? reason.kind : 'unknown'
+    tracker.end = { kind, reason, seq }
+    markUsed()
+    return 'settled'
+  }
+  return 'ignored'
+}
+
+/**
+ * follow 开场的 snapshot 帧：`{type:'snapshot', records:[{type:'event', event:{…}}], …}`。
+ * **不能把 snapshot 整个丢掉**——快任务可能在派发与订阅之间就已经跑完，答案只在这个快照里。
+ */
+export const consumeSnapshotFrame = (tracker, frame) => {
+  const records = frame !== null && frame !== undefined && Array.isArray(frame.records)
+    ? frame.records
+    : (frame !== null && frame !== undefined && Array.isArray(frame.events) ? frame.events : [])
+  let last = 'ignored'
+  for (const record of records) {
+    if (record === null || typeof record !== 'object') continue
+    const event = record.type === 'event' && record.event !== undefined && record.event !== null
+      ? record.event
+      : (typeof record.type === 'string' && record.seq !== undefined ? record : undefined)
+    if (event === undefined) continue
+    const outcome = consumeSessionEvent(tracker, event)
+    if (outcome === 'settled') return 'settled'
+    if (outcome === 'progress') last = 'progress'
+  }
+  return last
+}
+
+/** 由 tracker 得出终态结论：只有 completed 算成功；其他 kind 明确失败；没有证据=未确认。 */
+export const turnOutcome = (end) => {
+  if (end === undefined || end === null) return { ok: false, unconfirmed: true, kind: 'unconfirmed' }
+  if (end.kind === SUCCESS_TURN_END) return { ok: true, unconfirmed: false, kind: end.kind }
+  return { ok: false, unconfirmed: false, kind: end.kind }
 }
 
 /**
@@ -299,5 +431,7 @@ export const taskResponse = (task) => {
   if (task.target !== undefined && task.target !== null && task.target.kind === 'session' && task.delivered === true) {
     out.delivered = true
   }
+  // 来源关联（R1）：回显发起这次任务的 Codex 对话 id，便于跨回合按 origin+taskId 精确收取。
+  if (typeof task.originThreadId === 'string' && task.originThreadId !== '') out.originThreadId = task.originThreadId
   return out
 }

@@ -20,7 +20,92 @@ import {
   titleSimilarity,
   rankTitleCandidates,
   taskResponse,
+  createRequestTracker,
+  consumeSessionEvent,
+  consumeSnapshotFrame,
+  turnOutcome,
+  SUCCESS_TURN_END,
 } from '../harness/session-target.mjs'
+
+// ---------------------------------------------------------------- 请求 ↔ turn 关联（真实 SDK 字段形状）
+
+const turnStart = (seq, turn) => ({ seq, type: 'turn/start', data: { turn } })
+const userMessage = (seq, rpcId) => ({ seq, type: 'user/message', data: { id: 'u' + seq, role: 'user', source: { rpcId } } })
+const assistantMessage = (seq, turn, text) => ({ seq, type: 'assistant/message', data: { turn, step: 1, message: { content: [{ type: 'text', text }] } } })
+const turnEnd = (seq, turn, kind) => ({ seq, type: 'turn/end', data: { turn, reason: { kind } } })
+
+test('关联器：user/message 没有 data.turn 也能靠"未闭合 turn"定位自己那个回合', () => {
+  const tracker = createRequestTracker('req-1')
+  consumeSessionEvent(tracker, turnStart(1, 7))                 // 别人的回合先开
+  consumeSessionEvent(tracker, userMessage(2, 'other-request')) // 别人的请求
+  assert.equal(tracker.sawRequest, false, '别人的 rpcId 不能算匹配')
+  assert.equal(tracker.turn, undefined)
+  consumeSessionEvent(tracker, turnStart(3, 8))                 // 我们的回合开始
+  assert.equal(consumeSessionEvent(tracker, userMessage(4, 'req-1')), 'progress')
+  assert.equal(tracker.sawRequest, true)
+  assert.equal(tracker.turn, 8, 'rpcId 匹配时归到当时未闭合的那个 turn（user/message 没有 data.turn）')
+})
+
+test('关联器：只收自己那个 turn 的助手文本；别的 turn 的结束不产生终态', () => {
+  const tracker = createRequestTracker('req-1')
+  consumeSessionEvent(tracker, turnStart(1, 7))
+  consumeSessionEvent(tracker, userMessage(2, 'other'))
+  consumeSessionEvent(tracker, assistantMessage(3, 7, 'WRONG'))
+  assert.equal(consumeSessionEvent(tracker, turnEnd(4, 7, 'completed')), 'ignored', '别的回合结束不是我们的证据')
+  assert.equal(tracker.end, undefined)
+  assert.equal(tracker.text, '')
+
+  consumeSessionEvent(tracker, turnStart(5, 8))
+  consumeSessionEvent(tracker, userMessage(6, 'req-1'))
+  consumeSessionEvent(tracker, assistantMessage(7, 8, 'RIGHT'))
+  assert.equal(tracker.text, 'RIGHT')
+  assert.equal(consumeSessionEvent(tracker, turnEnd(8, 8, 'completed')), 'settled')
+  assert.deepEqual(turnOutcome(tracker.end), { ok: true, unconfirmed: false, kind: SUCCESS_TURN_END })
+})
+
+test('关联器：按 seq 去重（snapshot 与日志重复投递不会把文本算两遍）', () => {
+  const tracker = createRequestTracker('req-1')
+  const events = [turnStart(1, 1), userMessage(2, 'req-1'), assistantMessage(3, 1, 'ONLY-ONCE')]
+  for (const event of events) consumeSessionEvent(tracker, event)
+  for (const event of events) consumeSessionEvent(tracker, event)   // 再来一遍（同一 seq）
+  assert.equal(tracker.text, 'ONLY-ONCE')
+  assert.equal(consumeSessionEvent(tracker, turnEnd(4, 1, 'completed')), 'settled')
+  assert.equal(consumeSessionEvent(tracker, turnEnd(4, 1, 'completed')), 'ignored', '同一 seq 的结束只生效一次')
+})
+
+test('关联器：只有 completed 算成功，其余 kind 都是失败终态', () => {
+  for (const kind of ['aborted', 'blocked', 'error', 'max-tokens', 'interrupted', 'forked', 'unknown-kind']) {
+    const tracker = createRequestTracker('req-1')
+    consumeSessionEvent(tracker, turnStart(1, 1))
+    consumeSessionEvent(tracker, userMessage(2, 'req-1'))
+    consumeSessionEvent(tracker, assistantMessage(3, 1, 'partial'))
+    assert.equal(consumeSessionEvent(tracker, turnEnd(4, 1, kind)), 'settled')
+    const outcome = turnOutcome(tracker.end)
+    assert.equal(outcome.ok, false, kind + ' 不得当作成功')
+    assert.equal(outcome.unconfirmed, false)
+    assert.equal(outcome.kind, kind)
+    assert.equal(tracker.text, 'partial', '失败的回合仍保留部分文字（由上层明确标注）')
+  }
+  assert.equal(turnOutcome(undefined).unconfirmed, true, '没有证据 → 未确认')
+})
+
+test('关联器：follow 开场 snapshot.records 与轮询读日志共用同一规则', () => {
+  const tracker = createRequestTracker('req-1')
+  const frame = {
+    type: 'snapshot',
+    cursor: 4,
+    hasMore: false,
+    records: [
+      turnStart(1, 1),
+      userMessage(2, 'req-1'),
+      assistantMessage(3, 1, 'SNAPSHOT TEXT'),
+      turnEnd(4, 1, 'completed'),
+    ].map((event) => ({ type: 'event', event })),
+  }
+  assert.equal(consumeSnapshotFrame(tracker, frame), 'settled')
+  assert.equal(tracker.text, 'SNAPSHOT TEXT')
+  assert.deepEqual(turnOutcome(tracker.end), { ok: true, unconfirmed: false, kind: SUCCESS_TURN_END })
+})
 
 // ---------------------------------------------------------------- 目标判定
 test('classifyTarget: 不带 target 时保持 0.1.1 的 worker 行为', () => {
@@ -183,10 +268,10 @@ test('taskResponse: worker 与 session 各自回显目标，并带上 notes', ()
 
   const session = taskResponse({
     taskId: 't2', status: 'accepted', kind: 'task', deliver: 'steer',
-    target: { kind: 'session', sessionId: 'session-8d481ad9', snippet: '按文档启动OKX策略实验计划' },
+    target: { kind: 'session', sessionId: 'session-fixture-okx', snippet: '按文档启动OKX策略实验计划' },
     notes: ['history ignored for session targets'],
   })
-  assert.deepEqual(session.target, { kind: 'session', sessionId: 'session-8d481ad9', deliver: 'steer', snippet: '按文档启动OKX策略实验计划' })
+  assert.deepEqual(session.target, { kind: 'session', sessionId: 'session-fixture-okx', deliver: 'steer', snippet: '按文档启动OKX策略实验计划' })
   assert.deepEqual(session.notes, ['history ignored for session targets'])
 })
 
