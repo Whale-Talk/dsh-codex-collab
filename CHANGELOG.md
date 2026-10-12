@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.1.8 — 2026-10-12
+## 0.1.9 — 2026-10-13
+
+> **0.1.8 从未发布到 npm。** `v0.1.8` tag 建立后，CI 的 Linux gate 在 `test/codex-associations.test.mjs` 暴露了一个**仅测试代码**的跨平台断言缺陷：
+> 读取"目录位置被文件占住"的路径时，Linux 报 `ENOTDIR`（抛 `store-unreadable`）、Windows 报 `ENOENT`（落 `unknown-task`），而原断言只认后者。
+> 已把该断言改为跨平台不变量（写失败必须抛错；读失败必须响亮、且不得带出 record）。按"不得覆盖既有 tag/version"的规定，本版改用 **0.1.9** 发布；
+> **功能内容与 0.1.8 完全相同**（tag `v0.1.8` 仍指向当时的提交，未被移动）。
 
 ### 来源关联（R1）：Codex 派活 → DSH 执行 → 按来源精确收回
 

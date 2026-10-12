@@ -204,7 +204,7 @@ test('残尾不吞新记录；整文件损坏则明确报错（不降级成空�
   throwsReason(() => broken.bind({ originThreadId: 'origin-A', taskId: 't-9', kind: 'task', target: {} }), ASSOC_REASONS.STORE_CORRUPT)
 })
 
-test('写入失败必须显式抛出（调用方据此放弃启动执行）', () => {
+test('写入失败必须显式抛出（调用方据此放弃启动执行）；读失败也必须响亮', () => {
   const root = tmpRoot()
   const box = openAssociations({ root, namespace: 'ns' })
   // 把 namespace 目录换成文件，制造真实的写失败
@@ -212,8 +212,23 @@ test('写入失败必须显式抛出（调用方据此放弃启动执行）', ()
   fs.writeFileSync(box.dir, 'not a directory', 'utf8')
   let error
   try { box.bind({ originThreadId: 'origin-A', taskId: 't-1', kind: 'task', target: {} }) } catch (e) { error = e }
-  assert.notEqual(error, undefined, '写失败必须抛错，不能返回 undefined 假装成功')
-  assert.equal(box.fetch({ originThreadId: 'origin-A', taskId: 't-1' }).ok, false)
+  assert.notEqual(error, undefined, '写失败必须抛错（调用方据此放弃启动执行），不能返回 undefined 假装成功')
+
+  // 读也必须"响亮地失败"。跨平台差异：读一个"目录位置被文件占住"的路径时
+  // Linux 报 ENOTDIR（抛 store-unreadable），Windows 报 ENOENT（落到 unknown-task）。
+  // 两种都算响亮；唯一不允许的是**假装成功/假装空存储**。
+  let read
+  try {
+    read = box.fetch({ originThreadId: 'origin-A', taskId: 't-1' })
+  } catch (e) {
+    read = { threw: true, reason: e === null || typeof e !== 'object' ? undefined : e.reason }
+  }
+  if (read.threw === true) {
+    assert.equal(read.reason, ASSOC_REASONS.STORE_UNREADABLE, '读失败必须是显式的 store-unreadable')
+  } else {
+    assert.equal(read.ok, false, '读失败不得假装成功')
+    assert.equal(read.record, undefined, '读失败不得带出 record')
+  }
 })
 
 // ---------------------------------------------------------------- 真多进程并发写入
