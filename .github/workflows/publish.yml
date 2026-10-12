@@ -45,7 +45,7 @@ jobs:
           fi
           npm whoami --registry=https://registry.npmjs.org
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN2 || secrets.NPM_TOKEN }}
 
       - name: Syntax-check every shipped module
         run: |
@@ -257,4 +257,4 @@ jobs:
       - name: Publish to npm with provenance
         run: npm publish --provenance --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN2 || secrets.NPM_TOKEN }}
