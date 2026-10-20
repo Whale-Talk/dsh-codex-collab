@@ -69,7 +69,7 @@ jobs:
             const p = require("./package.json");
             const need = [
               "package.json", "cordis.patch.yml", "README.md", "LICENSE",
-              "harness/dsh-bridge.mjs", "harness/session-target.mjs", "mcp/dsh-mcp.mjs",
+              "harness/dsh-bridge.mjs", "harness/session-target.mjs", "harness/session-observer.mjs", "harness/audit-tail.mjs", "mcp/dsh-mcp.mjs",
               "codex-plugin/plugins/dsh/skills/dsh-collab/SKILL.md",
             ];
             if (p.name !== "@whaletalk/dsh-codex-collab") throw new Error("unexpected name: " + p.name);
@@ -152,7 +152,8 @@ jobs:
                 const list = lines.find(l => l.id === 2);
                 if (!init?.result?.serverInfo) throw new Error("initialize failed: " + buf);
                 const names = (list?.result?.tools || []).map(t => t.name).sort();
-                const want = ["dsh_read_file","dsh_review","dsh_sessions","dsh_task","dsh_task_cancel","dsh_task_status"];
+                // 精确断言新工具集合（9 个；旧 6 个原样保留 + 审批 2 个 + 模型目录 1 个）。不许靠删断言或 skip 掩盖失败。
+                const want = ["dsh_approval_decide","dsh_approvals","dsh_models","dsh_read_file","dsh_review","dsh_sessions","dsh_task","dsh_task_cancel","dsh_task_status"];
                 if (JSON.stringify(names) !== JSON.stringify(want)) {
                   throw new Error("tool set mismatch: " + JSON.stringify(names));
                 }

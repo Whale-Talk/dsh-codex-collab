@@ -4,6 +4,12 @@
 
 # DSH Collab — Codex × DeepSeek Harness 双向编码协作
 
+本项目 fork 自 [FuJackGao/dsh-collab](https://github.com/FuJackGao/dsh-collab)，在上游基础上由 [Whale-Talk](https://github.com/Whale-Talk) 继续维护与扩展。感谢原作者及上游贡献者。
+
+[安装与下载](#安装) · [升级方法](#升级到新版本) · [使用示例](#使用) · [npm 包](https://www.npmjs.com/package/@whaletalk/dsh-codex-collab) · [GitHub 源码](https://github.com/Whale-Talk/dsh-codex-collab)
+
+> **版本说明**：0.1.10 提供审批委托、queue/steer 投递控制、已配置模型自动选择与故障切换，以及大对话增量观察修复。升级时同时更新 DSH 网关和 Codex 侧 MCP/CLI，并重启 DSH 使新模块生效。
+
 **Codex 主导，DeepSeek 执行，Codex 验收。** 一个插件体系，让 ChatGPT（Codex）像项目经理一样把编码任务派给本机 DeepSeek Harness 的编码子代理，实时回传结果，读文件验收，并由独立评审员实际跑通构建/测试后出具评审报告。
 
 派活有**两种目标**，必须显式选一种——"接进用户正在用的那条对话"和"新建一个干活的子代理"是两件事：
@@ -55,15 +61,25 @@ flowchart LR
 
 ---
 
+## 大对话性能与排障
+
+同一会话的任务共享增量观察；健康的同进程事件或 follow 连接不会再每 2.5 秒全量读取历史。启动和断流补缺使用 SDK 的 `observeSession({ projectionMode: "none" })`，及时释放观察租约；旧 SDK 才降级到串行的 `readSession`。后台失败会退避，慢检查不会重叠，空闲 worker 不读取历史。
+
+兼容 DSH 0.2.0 与 0.2.1 的子代理入口。worker 长时间安静时只报告未确认，继续保留该任务的执行占用，收到官方结束后再回填结果；不会把旧结果交给后来派发的任务。
+
+审批和人工模型选择仍要求新鲜证据。事件缺口、读取失败或缓冲溢出会补缺或返回未确认，不会把缓存当作批准依据。增量回放与慢读缓冲各有 4 MiB 上限，不保留工具结果正文；任务自身的最终回答仍按原有方式返回。
+
+只读访问 `GET /api/dsh-bridge/debug` 可查看 `observation` 的完整读取/观察/缺口/失败计数，以及 `routeAuditTail` 的读取字节与截断标志。模型审计的状态回显只解码最近 1 MiB，原始 JSONL 仍完整保留，可用于历史回溯。冷会话第一次载入仍可能较慢；这次修复针对重复读取，不代表 DSH 的其他界面或插件性能问题均已解决。
+
 ## 组件
 
 | 目录 | 内容 | 说明 |
 |---|---|---|
 | `codex-plugin/` | Codex 本地市场插件包 | 标准 marketplace 结构（`.agents/plugins/marketplace.json` + 插件目录），含协作技能 `dsh-collab` |
-| `mcp/dsh-mcp.mjs` | MCP 服务器（零依赖 Node） | stdio 传输（Codex `[mcp_servers]` 直连）+ Streamable HTTP 传输（`--http`，供 Secure MCP Tunnel / cloudflared 桥接 ChatGPT）；6 个工具：`dsh_task` / `dsh_sessions` / `dsh_task_status` / `dsh_task_cancel` / `dsh_review` / `dsh_read_file` |
+| `mcp/dsh-mcp.mjs` | MCP 服务器（零依赖 Node） | stdio 传输（Codex `[mcp_servers]` 直连）+ Streamable HTTP 传输（`--http`，供 Secure MCP Tunnel / cloudflared 桥接 ChatGPT）；9 个工具：`dsh_task` / `dsh_sessions` / `dsh_task_status` / `dsh_task_cancel` / `dsh_review` / `dsh_read_file` / `dsh_approvals` / `dsh_approval_decide` / `dsh_models` |
 | `harness/dsh-bridge.mjs` | DeepSeek Harness 宿主组合网关插件 | 提供 HTTP 网关（`/api/dsh-bridge/*`）、WS 推送、原生工具；管理编码/评审子代理，并把任务投递进已有会话。**必须装进 harness 宿主组合**（见下文） |
-| `harness/session-target.mjs` | 会话目标的纯决策层 | 目标判定、候选挑选（0/1/N 不猜）、RemoteError→稳定 reason、基线切分、汇报选文。无 DSH import，可单测；`dsh-bridge.mjs` 依赖它，**两个文件必须一起部署** |
-| `test/` | 25 项 Node 测试 | `session-target` 纯函数单测 + `dsh-bridge` 路由级回归测试（假 DSH 运行时加载真实 bridge）。CI 每次都跑 |
+| `harness/session-target.mjs` | 会话目标的纯决策层 | 目标判定、候选挑选（0/1/N 不猜）、RemoteError→稳定 reason、基线切分、汇报选文。无 DSH import，可单测；`dsh-bridge.mjs` 依赖它，**源码手工部署时保留整个 `harness/` 目录** |
+| `test/` | Node 行为回归测试 | `session-target` 纯函数单测 + `dsh-bridge` 路由级回归测试（假 DSH 运行时加载真实 bridge）。CI 每次都跑 |
 | `templates/codex-mcp/` | 反向通道配置模板 | 把 Codex CLI 当 MCP 服务端挂进 DSH（得到 `mcp__codex__*` 工具），让 DSH 侧也能调用 Codex。见下文「反向通道」 |
 | `cordis.patch.yml` | bundle patch | 把网关插件挂进 DSH 宿主组合；`dsh.bundle.patch` 指向它，所以 `dsh plugin add` 能自动 reconcile |
 
@@ -81,7 +97,17 @@ flowchart LR
 
 ## 安装
 
-### 0. 一条命令装全部（推荐，npm）
+### npm 安装（推荐）
+
+前提：Node.js **20.11 或更新版本**、npm，以及已安装的 DeepSeek Harness（desktop 或 web profile）。本包提供插件和协作工具，DSH 本体需另行安装。
+
+安装包名为 **`@whaletalk/dsh-codex-collab`**。可先查询 npm 已发布版本：
+
+```sh
+npm view @whaletalk/dsh-codex-collab version
+```
+
+下面两步分别安装 DSH 网关和 Codex 侧工具，两端都需要：
 
 ```sh
 # 1) 网关插件装进 harness profile（自动 reconcile bundles，无需手工复制文件）
@@ -109,12 +135,13 @@ curl http://127.0.0.1:3080/api/dsh-bridge/status
 
 装完**必须重启 profile 进程**——`dsh plugin add` 改的是 bundles 列表与 node_modules，HMR 不监控这两处；**替换包内容也不会热重载**（ESM 缓存），只有重启进程才加载新版本。
 
-### 升级到新版本（有坑，照做）
+### 升级到新版本
 
 ```sh
-# 1) 带精确版本号安装：不带版本号时 lockfile 会把旧版按回来
-dsh plugin --profile desktop add @whaletalk/dsh-codex-collab@<新版本>
-# 2) 重启 profile 进程：不重启不会加载新的 JS 模块
+# 将 X.Y.Z 替换成 npm 已发布的新版本号；两端使用同一版本
+dsh plugin --profile desktop add @whaletalk/dsh-codex-collab@X.Y.Z
+npm install -g @whaletalk/dsh-codex-collab@X.Y.Z
+# 保存当前工作后，重启 DSH profile，并重新加载 Codex 的 MCP 连接
 ```
 
 - **不要用"卸载 → 重装"**：卸载会把这个包从 `dsh.profile.bundles` 移除；重装后若没被重新选中，插件根本不会挂载（表现：所有 `/api/dsh-bridge/*` 都落到网关鉴权层返回 **401**）。真遇到了就在客户端插件页把它的开关打开。
@@ -135,7 +162,7 @@ dsh plugin --profile desktop add @whaletalk/dsh-codex-collab@<新版本>
       name: './harness/dsh-bridge.mjs'
 ```
 
-> `dsh-bridge.mjs` 会 `import './session-target.mjs'`——**两个文件必须在一起**，只复制前者会直接加载失败。
+> 网关依赖同目录下的会话关联、审批和锁模块。**复制整个 `harness/` 目录并保留结构**，不要只挑 `dsh-bridge.mjs` 和 `session-target.mjs`。
 
 重启 harness。默认共享工作目录为 `D:\Harness`，可用环境变量 `DSH_BRIDGE_WORKSPACE` 覆盖。验证：
 
@@ -147,12 +174,12 @@ GET http://127.0.0.1:3080/api/dsh-bridge/status
 
 ### 2. Codex 侧（二选一或都用）
 
-**A. MCP 工具（推荐，走 Codex 官方通道）**：把 `mcp/dsh-mcp.mjs` 放到本机任意位置，在 `~/.codex/config.toml` 追加：
+**A. MCP 工具**：保留完整源码目录（包括 `mcp/` 和 `harness/`），在 `~/.codex/config.toml` 追加；不要把 `dsh-mcp.mjs` 单独拷走，它会导入 `../harness/codex-approvals.mjs`：
 
 ```toml
 [mcp_servers.dsh]
 command = 'node'
-args = ['<绝对路径>/dsh-mcp.mjs']
+args = ['<项目绝对路径>/mcp/dsh-mcp.mjs']
 startup_timeout_sec = 120
 ```
 
@@ -207,9 +234,12 @@ dsh_sessions({ "query": "按文档启动OKX策略实验计划" })
 // → { "items": [{ "sessionId": "session-example-…", "snippet": "按文档启动OKX策略实验计划",
 //                 "agentAvailable": true }], "matchedBy": "list" }
 
-// 2) 投递进那条会话
-dsh_task({ "instruction": "继续推进第 3 步…", "sessionId": "session-example-…" })
-// deliver 可选 "queue"（默认，排队）或 "steer"（插入当前回合）
+// 2) 排队派活，记录返回的 taskId（来源必须显式传当前 Codex 对话 id）
+dsh_task({ "instruction": "继续推进第 3 步…", "sessionId": "session-example-…", "originThreadId": "<当前 Codex 对话 id>", "deliver": "queue", "wait": false })
+
+// 3) 当前源码支持：向正在运行的父任务补充（需控制凭据与投递能力）
+dsh_task({ "instruction": "给原任务补充验收要求…", "sessionId": "session-example-…", "originThreadId": "<当前 Codex 对话 id>", "deliver": "steer", "parentTaskId": "<上一步 taskId>", "wait": false })
+// 返回的是补充回执；最终结果仍按原 originThreadId + 父 taskId 查询。父任务尚在排队或已结束时不能 steer。
 ```
 
 **命令行**（npm 安装后直接用；源码方式用 `node <脚本路径>`）：
@@ -221,8 +251,10 @@ dsh-task --in "<指令>" --cwd "<目录>" [--lane backend] [--model fast|pro] [-
 # 接进已有会话：先找（或先空跑验证），再派
 dsh-task --sessions "<标题关键词>"                    # 只读列候选，拿 sessionId
 dsh-task --dry-run --find "<标题关键词>"               # 只解析目标、回显命中，不投递任何消息
-dsh-task --in "<指令>" --session "<sessionId>" [--steer]
-dsh-task --in "<指令>" --find "<标题关键词>"           # 唯一命中才派；否则退出码 4
+dsh-task --in "<指令>" --session "<sessionId>" --origin "<当前 Codex 对话 id>"
+# 当前源码：补充一条正在运行的父任务；--parent 同时选择 steer
+dsh-task --in "<补充>" --session "<sessionId>" --origin "<当前 Codex 对话 id>" --parent "<父 taskId>"
+dsh-task --in "<指令>" --find "<标题关键词>" --origin "<当前 Codex 对话 id>" # 唯一命中才派；否则退出码 4
 
 dsh-review --cwd "<目录>" [--diff git|@文件|"diff文本"] [--focus "<重点>"]
 dsh-task --list | --status <taskId> | --cancel <taskId> [--force]
@@ -243,12 +275,12 @@ dsh-task --dry-run --find "量化框架"
 #    "candidates":[{"sessionId":"1c0f99f8-…","snippet":"你是一个量化研究项目的技术","score":0.333}, …]}
 
 # 2) 接通（投递进那条会话；这一轮的助手回复作为汇报返回，只回报本轮新增文本）
-dsh-task --in "<继续推进的指令>" --session "session-example-…"
+dsh-task --in "<继续推进的指令>" --session "session-example-…" --origin "<当前 Codex 对话 id>"
 ```
 
 `matchedBy` 说明"找到"走了哪条路：`search` = 会话搜索索引；`list` = 索引被部署禁用时退回遍历列表 + 标题投影（都不激活 Agent）。
 
-**`delivered` 与排队语义**（重要）：`prompt` 一旦被目标会话接受，就表示消息**已经进了它的队列**，响应里会带 `delivered: true`；此后即便我们的观察超时（会话可能正跑一个很长的回合），也**不要重发**——重发会让同一份内容在用户会话里出现两次。`queue` 模式不再用 120s 判失败：没在 120s 内开跑只记一条 note 并继续等，最终由总预算（默认 1h）收口为 `session-timeout` + `delivered: true`。
+**`delivered` 与排队语义**（重要）：`prompt` 一旦被目标会话接受，就表示消息**已经进了它的队列**，响应里会带 `delivered: true`；此后即便我们的观察超时（会话可能正跑一个很长的回合），也**不要重发**——重发会让同一份内容在用户会话里出现两次。已接收的 `queue` 任务未在 120s 内开跑只记 note；带来源任务必须观察到自身回合结束，观察窗口到期而证据不足时返回 `unknown` + `resend:false`（不把观察超时当执行失败）。有效审批委托按其授权窗口观察。
 
 失败返回稳定 `reason` 且**不创建任何会话/工作区**：`session-query-empty`（没命中，附 `candidates`）、`session-ambiguous`（多条命中，附 `candidates`）、`session-not-found`、`session-busy`、`session-writer-held`（会话被别的写入方占用）、`session-archived`、`session-not-accepted`（仅当 prompt **未被接受**）、`session-timeout`、`session-cancel-refused`（取消会话目标默认被拒，需 `--force`）。
 
@@ -367,7 +399,7 @@ dsh-task --status "<taskId>" --origin "<当前 Codex 对话 id>"
   **不是**完成证明。落盘并回显（内存分支与恢复分支都给）：`requestId`（=taskId）与匹配到的 `dshTurn`；
   `turnEndKind`/`partialResult` 以及未确认时的 `resend`/`note` **只在活任务的内存响应里**出现（不在持久记录里；
   重启后非终态记录由恢复分支合成 `unknown` + `resend:false`）。
-- **带来源时拒绝 `steer`**（`origin-steer-unsupported`，执行前拒绝、零投递）：steer 会把一批请求合进同一个回合，无法为单个请求保证归属。
+- **带来源的 `steer` 是父任务补充回执**：必须显式给同来源、同会话且正在运行的父 `taskId`，并有控制凭据。回执只报告自身是否被观察、是否偏离目标回合；不承载父结果、不成为审批 owner。旧网关没有 `capabilities.delivery` 时，客户端在派活前拒绝。
 - **没有证据就是未确认**：无匹配 `rpcId` 的终态、quiet/预算到期 → `status:"unknown"` + `resend:false`，绝不猜 done、绝不重发。
 - **网关必须回显并匹配 `originThreadId` 才算确认绑定/取值**：能力检查通过≠这次绑定成功（网关可能中途重载/旧 handler）。
   未确认时 MCP/CLI 都按"未确认 + 禁止重发"上报（CLI 退出码 8），**不返回**那种响应里的结果。
@@ -384,10 +416,48 @@ dsh-task --status "<taskId>" --origin "<当前 Codex 对话 id>"
 验证：`node test/codex-r1-contracts.test.mjs`（8 项：非法来源零执行、已关联任务缺/错来源拒绝、通道 busy、旧网关零执行拒绝、能力上报、
 能力通过但未确认来源 → 未确认+禁止重发、列表 unknown 语义、CLI 严格参数）、
 `node test/codex-session-correlation.test.mjs`（8 项：真实 SDK 字段的请求↔回合关联：排队请求忽略先前回合、只有自己 turn/end 才完成、
-error/blocked 不得 done、snapshot.records、重复投递不串文本、快照缺前半段回填、无匹配 rpcId → 未确认、steer 拒绝）、
+error/blocked 不得 done、snapshot.records、重复投递不串文本、快照缺前半段回填、无匹配 rpcId → 未确认、无有效父任务的 steer 拒绝）、
 `node test/codex-association-e2e.test.mjs`（3 项：**真实 HTTP + 独立 MCP 进程 + 独立 CLI 进程** 的跨回合收取与重启恢复）、
 `node test/codex-associations.test.mjs`（13 项：存储/不可改投/来源校验/失败不泄漏 record/跨重启/命名空间隔离/真多进程并发/任务表淘汰）、
 `node test/dsh-bridge.test.mjs`（13 项：非法来源 400、执行前落盘、新实例恢复、200+ 记录、存储故障拒绝派活）。
+
+## 审批委托：Codex 接手 DSH 单次审批（needs-approval 闭环）
+
+当 DSH 执行需要一次审批（沙箱升级等）而你不在电脑前时，受委托且正在等待/处理任务的 Codex 对话可以**逐次**决定。前提是网关与客户端都已加载支持该功能的版本，控制凭据、委托范围与租约有效；它不会自动唤醒空闲的 Codex 聊天。超出范围、证据不足、断线/过期时交还人工链。
+
+```bash
+# 0) 只做一次：离线初始化控制凭据（仓库/工作区之外的私有目录；raw key 不回显、不上线）
+dsh-task --approval-key-init          # 轮换：--approval-key-rotate（= 撤销全部旧 grant）
+
+# 1) 派活时显式开启委托（grant 与 task+origin 绑定**先于** prompt；任何失败=零派活）
+dsh-task --in "<指令>" --session <会话id> --origin <当前对话id> --delegate [--authorization "本次授权范围"]
+
+# 2) 任务在等审批时以退出码 9 及时返回（非终态）→ 取真实动作 → 单次决定
+dsh-task --approvals --origin <id> --task <taskId> --grant <grantId>
+dsh-task --approve <approvalKey> --origin <id> --task <taskId> --grant <grantId> --fingerprint <fp>
+# 3) 继续收结果（等待期间认证续租；长任务可 --renew-grant 在原窗口内显式续期）
+dsh-task --status <taskId> --origin <id> --grant <grantId> --status-wait
+```
+
+- **MCP**：`dsh_task { delegate: true, authorization }`、`dsh_approvals { originThreadId, taskId }`、`dsh_approval_decide { originThreadId, taskId, approvalKey, grantId, fingerprint, decision }`、`dsh_task_status { wait: true, grantId }`、`dsh_models { force? }`（工具集 6 → 9：旧 6 个原样保留 + 审批 2 个 + 模型目录 1 个）。委托派活/状态响应带**非秘密** `grantId`/`grantExpiresAt`/`grantLeaseUntil`，等待循环据此**自适应认证续租**（短租约也不会过期，不扩大永久授权）。
+- **动态模型路由（第五轮新功能，`model:auto` 默认）**：插件管理的任务（编码/评审子代理、有明确来源的普通会话 queue 任务）在**派活前**从本机**已注册** provider 目录里选模型，并在模型失效时有界切换：
+  - 输入：`model` 支持 `auto`（默认）/`fast`/`pro`（兼容偏好）/`default`（继承当前选择）/精确模型 id；精确指定可配 `provider`（跨 provider 同名模型**不合并**，缺 provider 时明确拒绝并给候选）；`modelFallback:false` 关闭本任务切换（精确指定默认固定）。
+  - **四个入口同一契约**：HTTP `/api/dsh-bridge/task`、`/api/dsh-bridge/review`、MCP `dsh_task`/`dsh_review`、CLI `task.mjs`/`review.mjs`（`--session`/`--find`/`--cwd` 三种目标一致；评审与编码同 kind=review/worker 语义，评审也支持 `--origin`、模型预检与逐次 status 来源核对）。原生工具 `dsh_collab_send`/`dsh_collab_review` 走同一任务级机制。`provider+model` 是**一对身份**，任何入口都不会只发一半。
+  - 只读目录：`GET /api/dsh-bridge/models`、MCP `dsh_models`、CLI `dsh-task --models`；`capabilities.modelRouting` 供客户端**预检**（旧网关遇到新语义零派活）。
+  - 归属与恢复：首请求用官方 `agent/inbox/claimed` 按派活前登记的 requestId 认领（不靠事后日志）；失败只用**稳定 failure.code** 分类，同 turn/step 内切换（不重派 prompt、不新建 child、不重跑已执行工具）；默认最多 3 个不同候选、每候选与整任务都有时限；用户取消/安全拦截/审批拒绝/工具错误/未知异常**不**靠切模型绕过。
+  - 边界：目录可见 ≠ 凭据/额度/远端健康已验证（没有质量/价格评分，`toolUpdate` 不是"支持工具"布尔）；不使用 `selectModel`/`saveSelection`，不改 readonly options/全局 preset；任务收口时**条件恢复**用户原选择（人类后选的模型优先）。
+  - 证据：[docs/DSH_MODEL_ROUTING_M0_EVIDENCE.md](docs/DSH_MODEL_ROUTING_M0_EVIDENCE.md)；审计（稳定 code，无正文/密钥）落 `<assoc>/model-routing.jsonl`，任务状态可查 `route` 与 `routeAudit`。
+- **认证**：`X-Dsh-Control` 传**私有 raw key**（MCP/CLI 内部读取；服务端只存域分离单向摘要，**摘要不能用于登录**）；缺 key = 能力关闭；不存在未认证的 enable/bootstrap/领 token 路由。
+- **授权**：`origin/task/session/callId` 只是定位符，**不构成授权**；真正的授权 = 绑定 task/origin/session/版本/期限的不可变 grant + 服务端按**不可变宿主快照**核对的指纹 + 单次状态机 + 审计写成功才放行。审批查询/决定必须显式带 `originThreadId`+`taskId`（服务端硬核对，绝不跨来源泄露）。
+- **投递控制 queue / steer（第四轮新功能）**：DSH 忙时不再只有一个"busy 拒绝"——Codex 可按任务关系**自己选择**：
+  - `queue`（默认）：排进**官方原生 FIFO**，当前任务完成后执行；忙时也可靠接收（202），每个任务有独立 taskId/requestId/回合/结果，互不覆盖。官方 `claim()` 一次只取一条 next-turn（`dsh-agent-loop:103-109`），所以排队任务各自独占自己的回合。
+  - `steer`：作为**补充回执**插进**显式父任务**的当前回合（官方 `next-step`，同 turn 被消费）。必须给 `parentTaskId`（可选 `expectedTurn`），父必须同 origin/同会话**正在执行**；回执有独立 taskId/observedTurn，**不签发也不扩大父 grant、不成为审批 owner、不伪装独立结果**（`resultScope: parent-task`），父任务的最终结果仍归父任务。
+  - 由 Codex 在工具参数里显式选 `deliver`（服务器**不按关键词猜**急迫程度）；`--steer` 兼容保留但语义改为"父回执"。HTTP/MCP/CLI/DSH 原生工具都支持；steer 复用既有离线控制 key 做内部鉴权（MCP/CLI 自动带头，**缺凭据零插入**），旧网关缺 `capabilities.delivery` 时**零派活**拒绝。旧无来源 queue 路径行为不变（忙锁保持）。
+  - 官方契约证据：[docs/DSH_DELIVERY_M0_EVIDENCE.md](docs/DSH_DELIVERY_M0_EVIDENCE.md)（真实 SDK 队列顺序/消费时机/竞态）。
+- **语义边界**：只 `approve-once`（官方唯一许可，且由那一次调用消费）；官方 ask 身份必须唯一认领（同 callId 两次 ask = 两条独立 pending、两次独立决定）；`next()` 交还人工、绝不吞链；**完整执行身份**（toolName/root/parent/cwd/真实参数 + 日志实时 turn/step）任一变化即拒绝旧审批，身份拿不到时明确 unsupported 而不放行；有效认证委托按 **grant 有效期**观察（不被 quiet/总预算误收口），失联/撤销/到期后有界退出并交还人工；`needs-approval` 保持父任务在途及审批所有权；带来源的新 queue 可排队，旧无来源路径仍保留忙锁；活跃审批绝不重复列进 `unanswerable`（重启恢复语义不变：submitted→decision-unknown、未决定→unanswerable）；到期/失联/取消/卸载/内部错误 → 有界收口或 `next()` 且**先关闭可答状态**（迟到批准被拒），**绝不凭超时放行**；自己不写 `approval/asked|decided`；官方 `decided` 的 outcome 决定状态（cancelled/rejected 绝不算批准，reject 的终态是 `rejected` 而非 `confirmed`）；不动 `approval/policy`/preset/never。
+- **如实报 false 的能力**：worker 子代理目标（child 身份未证明，委托派活前拒绝）、PTC（callId/root 未证明，嵌套调用一律 `next()`）、空闲自动唤醒（仍 blocked）。
+- **加载前提**：答复者是宿主 bundle 插件——**安装更新包 + 重启 profile** 后才在真实桌面生效。
+- 详见 [docs/DSH_APPROVAL_DELEGATION.md](docs/DSH_APPROVAL_DELEGATION.md)；官方接口取证见 [docs/CODEX_DSH_APPROVAL_M0_EVIDENCE.md](docs/CODEX_DSH_APPROVAL_M0_EVIDENCE.md)。
 
 ## 环境变量
 
@@ -397,10 +467,12 @@ error/blocked 不得 done、snapshot.records、重复投递不串文本、快照
 | `DSH_BRIDGE_WORKSPACE` | `D:\Harness` | 网关默认共享工作目录 |
 | `DSH_BRIDGE_ROOT` | `D:\Harness` | `dsh_read_file` 相对路径基准 |
 | `DSH_BRIDGE_HISTORY` | 多级降级 | 协作历史文件位置（默认 D 盘 → 用户目录 → 临时目录逐级降级） |
-| `DSH_BRIDGE_SESSION_DISPATCH_TIMEOUT_MS` | `120000` | 会话任务被接受后、迟迟没开始跑的容忍时间（仍在排队则报 `session-not-accepted`） |
-| `DSH_BRIDGE_SESSION_QUIET_TIMEOUT_MS` | `600000` | 见过 running 之后多久没有新助手文本算跑完 |
+| `DSH_BRIDGE_SESSION_DISPATCH_TIMEOUT_MS` | `120000` | 未开跑的观察阈值；prompt 已被接受时仅提示排队，不据此判执行失败 |
+| `DSH_BRIDGE_SESSION_QUIET_TIMEOUT_MS` | `600000` | 安静观察阈值；带来源任务缺少自身 turn/end 时只能报 unknown，不能据此判完成；有效委托不因 quiet 提前收口 |
 | `DSH_BRIDGE_SESSION_TOTAL_TIMEOUT_MS` | `3600000` | 单个会话任务的总预算 |
 | `DSH_CODEX_TASK_ASSOC_DIR` | `~/.dsh-codex-task-assoc` | 任务关联记录的存储根（**默认只在用户目录，绝不写仓库**） |
+| `DSH_APPROVAL_CONTROL_KEY_PATH` | `~/.dsh-codex-approval/control.key` | 审批控制凭据文件（**仓库/工作区之外**，64-hex；宿主与 MCP/CLI 内部读取，HTTP 以 `X-Dsh-Control` 传私有 raw key）。缺文件或格式不合规=审批能力关闭 |
+| `DSH_APPROVAL_DIR` | `~/.dsh-codex-approval` | 审批 grant/审计存储根（JSONL；测试用独立临时根） |
 | `DSH_BRIDGE_ASSOC_NAMESPACE` | `default` | 关联记录的命名空间（`[A-Za-z0-9._-]{1,64}`）；多 profile 可各自一个来分隔存储 |
 
 ## 已知限制
@@ -409,7 +481,7 @@ error/blocked 不得 done、snapshot.records、重复投递不串文本、快照
 - **`sessionController.search` 可能被部署禁用**（`session-query` 索引 `openAt: "never"`）。此时按标题查找自动退回 `list`（读持久化 header + 标题投影，同样不激活 Agent），响应里的 `matchedBy` 标明走了哪条路
 - **不能投递进子代理会话**：`resolveAgent` 对 subagent 路由拥有的会话返回 `session-busy: owned by subagent routing`；只能接普通会话
 - `POST /api/dsh-bridge/sessions {"create": true, "cwd": "..."}` 可新建一条空白会话（探针/一次性任务用），它不会碰任何已有会话
-- **同一会话同时只允许一个在途 bridge 任务**：DSH 自己会排队，但无法可靠地把两次并发派活的回报各自归属，所以第二个会被明确拒绝（`session-busy`）而不是猜
+- **带来源的会话任务支持多个 queue**，各自绑定请求和回合；旧无来源任务仍有忙锁，并拒绝与带来源任务在同一会话混用。补充必须指定正在运行的父任务；无法逐项安全撤回队列/回执时拒绝取消，避免清掉别人的队列。
 - **冷会话可能接不上**：DSH 激活 Agent 需要会话投影（`Agent activation requires a projected Session observation`），未激活的会话会返回 `session-not-activatable`；归档会话的回合会以 `blocked` 收口（`session-archived`）
 - **评审不支持会话目标**：评审员必须与编码会话隔离，"独立评审"才成立
 - session 目标不使用 `cwd`/`lane`/`model`/`--commit`（会话自带这些语义），传了会被判 `invalid-target`
@@ -431,12 +503,20 @@ error/blocked 不得 done、snapshot.records、重复投递不串文本、快照
 ```sh
 node test/session-target.test.mjs      # 纯函数：目标判定 / 候选挑选 / 错误映射 / 基线切分 / 汇报选文
 node test/dsh-bridge.test.mjs          # 路由级：假 DSH 运行时 + 桩 peer，加载真实 bridge 跑真实路由
-node --test test/*.test.mjs            # 两个一起跑（CI 用的是这条）
+node --test test/*.test.mjs            # 全部行为回归（CI 用的是这条）
 ```
 
 - 路由级测试会断言 **worker 分支确实调用了 `startContinuable`**、**session 分支只调用 `prompt` 且不建 owner/子代理**——这类"参数遮蔽/串线"缺陷只有在这一层才抓得到（v0.1.2~0.1.4 的 `deliver` 遮蔽 bug 就是它抓回来的）。
-- CI（`.github/workflows/publish.yml`）每次 tag 都跑：语法检查 → 单测 → 包契约 → 版本号三处一致 → tarball 清单 → 干净目录安装 + CLI/MCP 冒烟 → 6 工具握手断言 → bridge 导出契约。**任何一步失败都不会发布**。
+- CI（`.github/workflows/publish.yml`）每次 tag 都跑：语法检查 → 单测 → 包契约 → 版本号三处一致 → tarball 清单 → 干净目录安装 + CLI/MCP 冒烟 → 8 工具握手断言 → bridge 导出契约。**任何一步失败都不会发布**。
 - 发布：`package.json` / `.codex-plugin/plugin.json` / `mcp/dsh-mcp.mjs` 的 `SERVER_VERSION` 三处同步改版本 → commit → 打 tag `vX.Y.Z` → 推 tag，CI 自动带 provenance 发布。
+
+## 项目来源与鸣谢
+
+- **上游原项目**：[FuJackGao/dsh-collab](https://github.com/FuJackGao/dsh-collab)。
+- **原作者**：[FuJackGao](https://github.com/FuJackGao)，以及参与上游项目的所有贡献者。感谢他们提供原始协作实现与开源基础。
+- **本 fork**：[Whale-Talk/dsh-codex-collab](https://github.com/Whale-Talk/dsh-codex-collab)。后续工作在上游基础上开展，包括 npm 包分发、任务与来源对话关联、审批委托及 queue/steer 投递控制等扩展；各功能是否已发布，以本文的发布状态和 npm 实际版本为准。
+
+本项目保留原有版权与许可声明，许可证见 [LICENSE](LICENSE)。
 
 ## License
 

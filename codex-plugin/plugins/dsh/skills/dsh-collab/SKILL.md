@@ -58,7 +58,9 @@ dsh-task --in "<完整中文指令>" --find "<标题关键词>"     # 唯一命�
 - `--lane`：并行通道名（默认 main）。同一目录不同 lane 的任务**并行执行**；跨目录天然并行。
 - `--model`：`fast`（deepseek-v4-flash，快而省）或 `pro`（deepseek-v4-pro，质量优先）；默认继承当前模型。session 目标不使用此参数（会话自己有模型）。
 - `--commit`：任务完成后在 `--cwd` 自动 `git add -A` 并提交；非 git 仓库自动跳过。session 目标禁止使用（会话自带工作目录，本工具不替它提交）。
-- `--steer`：仅 session 目标。默认 `queue`（排队，等它忙完再跑）；`--steer` 会插入当前回合、改变它正在做的事——**只在用户明确要求打断时用**。
+- `--steer` / `--parent <父taskId>`：仅 session 目标。**默认 `queue`**（排进官方 FIFO，等当前任务忙完再跑）；
+  `--parent`（等价 `--steer --parent`）表示"**作为补充回执插进那条父任务的当前回合**"。用户已授权你在同一任务范围内**自主选择**：
+  需要排队就 `queue`，需要补充/纠正正在执行的父任务就 `steer`；**用户显式指定的模式优先**。steer 必须给正确父任务（同来源/同会话/正在执行/回合可证）并自带控制鉴权，否则执行前零投递拒绝。
 - 指令必须包含：目标与产出物、验收标准、约束。`--wait` 为默认行为（结果直接回本对话），长任务加 `--timeout 1800`。
 
 退出码：`0` 成功 / `1` 失败 / `2` 用法（含缺少来源、`--origin` 缺值、网关不支持来源绑定） / `3` 超时 / `4` 会话未命中或不唯一 / `5` session 目标取消被拒 / `6` 按 taskId 查询取不到（未知任务 / 已关联但缺来源 / 来源不匹配） / `7` 派活被拒（通道忙） / `8` 网关未确认来源绑定（可能已执行，**不要重发**）。
@@ -86,8 +88,13 @@ dsh-task --status "<taskId>" --origin "<当前对话id>"
   只收该回合的助手文本；只有该回合并以 `completed` 结束才算成功，`aborted/blocked/error/max-tokens/interrupted/forked`
   一律是**明确失败**（部分文字放在 `partialResult`，仅内存可见；落盘的是 `status`/`error`/`reason`/`requestId`/`dshTurn`）。
   因此"会话里别的回合跑完"不会把你的任务判成完成。
-- **带来源时不能用 `--steer`**：steer 会把一批请求合进同一个回合，无法为你的请求单独保证归属；会被**执行前拒绝**（`origin-steer-unsupported`，零投递）。
-  旧的无来源 steer 行为保留。
+- **带来源时的 `--steer`（第四轮投递控制）**：来源绑定 steer **是支持的**，但必须是**父任务回执**——
+  显式给 `--parent <父taskId>`（可选 `--expected-turn`），父任务须同来源/同会话/**正在执行且回合可证**，
+  且本机要有控制 key（steer 改动既有任务，缺 key 零投递）。
+  预检不通过（无父 / 父已结束 / 父还在排队 / 来源不符 / 回合不符 / 缺凭据）→ **执行前拒绝、零投递**。
+  回执只报**自身**状态（`receipt-observed` / `receipt-deviated` / `receipt-unconfirmed` / `receipt-pending`，`resultScope=parent-task`），
+  **不代表父任务结果、也不参与审批归属**；未观察到时 `resend:false`，父任务结果请查父 task。
+  非 session 目标（worker）不走 steer。
 - **没有证据就是未确认**：`api-session/status` 只表示 agent 是否在跑，**不是**你的请求完成的证明。
   若一直没观察到匹配回合的结束（例如快照/日志里缺前半段），到时会返回 `status: "unknown"` + `resend: false`——**不要重发**。
 - **网关必须回显来源才算确认**：派活/取值的响应里必须带**匹配的** `originThreadId`；若网关接受了请求却没回显（例如中途重载/旧 handler），
@@ -123,7 +130,60 @@ dsh-task --cancel <taskId>             # 取消 worker 任务
 dsh-task --cancel <taskId> --force     # 取消 session 目标任务（会打断用户自己的回合，默认被拒）
 ```
 
+## 审批委托（任务等审批时由你逐次决定，用户不在也能继续）
+
+```bash
+# 0) 只做一次：离线初始化控制凭据（仓库/工作区之外的私有目录；raw key 不回显、不上线）
+dsh-task --approval-key-init           # 轮换用 --approval-key-rotate（会让全部旧 grant 立即失效）
+
+# 1) 派活时显式开启委托（grant 与 task+origin 绑定先于 prompt；失败=零派活）
+dsh-task --in "<指令>" --session <id> --origin <对话id> --delegate [--delegate-ttl 秒] [--delegate-lease 秒] [--authorization "本次授权范围"]
+#   初次默认等待与下面的 --status-wait 是同一条有界等待路径：带 origin 逐次核对回显、按租约自适应认证续租、
+#   遇到 needs-approval 立即 exit 9（不必先手动查 grant，也不必再调一次 --status-wait 才能续租）。
+
+# 2) 任务等你审批时会以退出码 9 立即返回（不是失败、不是完成）
+dsh-task --status <taskId> --origin <id>     # status=needs-approval 时看 needsApproval/approvalPendingCount
+dsh-task --approvals --origin <id> --task <taskId> [--grant <grantId>] [--wait-approval 秒]
+
+# 3) 逐条单次决定（approvalKey/grantId/fingerprint 都来自上一步；多余字段与参数副本一律被拒）
+dsh-task --approve <approvalKey> --origin <id> --task <taskId> --grant <grantId> --fingerprint <fp> [--idem 幂等键]
+dsh-task --reject  <approvalKey> --origin <id> --task <taskId> --grant <grantId> --fingerprint <fp>
+
+# 4) 决定后继续收结果（等待期间会做认证续租）
+dsh-task --status <taskId> --origin <id> [--grant <grantId>] --status-wait
+
+# 撤销 / 在原授权窗口内显式续期
+dsh-task --revoke-grant <grantId> --origin <id> --task <taskId> [--reason "…"]
+dsh-task --renew-grant  <grantId> --origin <id> --task <taskId> [--extend 3600]
+```
+
+- **MCP 等价**：`dsh_task { delegate: true, authorization }` / `dsh_approvals { originThreadId, taskId, … }` /
+  `dsh_approval_decide { originThreadId, taskId, approvalKey, grantId, fingerprint, decision: "approve-once"|"reject" }`；
+  `dsh_task_status { wait: true, grantId }` 可阻塞轮询到终态（遇 `needs-approval` 会立即返回，等待期间认证续租）。
+- **`origin`+`task` 是必填定位**（服务端还会与 pending/grant 硬核对）；它们**不是授权**，绝不能只凭它们放行。
+- 控制凭据只在 MCP/CLI 内部读取并作为 `X-Dsh-Control` 头发出；raw key 不出现在参数、结果、错误或审计里。
+- **看到 `needs-approval` 不要重发任务**：它是非终态，只差你对挂起项做一次决定。
+- `submitted ≠ confirmed`：再查一次看到 `state=confirmed`（官方 `approval/decided=allowed-once` 已观测）才算确认；`decision-unknown` 表示确认丢失——**不要重发放行**；若官方 outcome 是 cancelled/rejected，绝不会被记成批准。
+- 只接手能严格证明属于本委托的请求：无 callId / 无宿主参数快照 / 工具名不符 / turn·step 证明不了 / 不是自己那个 turn / PTC 嵌套（`…:ptc:<n>`）/ 父子混淆 / 官方 ask 身份歧义 → 一律交还人工（`next()`）；worker 与 PTC 能力如实报 false。
+- 审批类退出码：`9` = 等待审批（非终态）；`0-8` 语义不变；缺本机 key / 预检不支持 → `2` 且**零派活**。
+
+- **投递模式（queue / steer，第四轮）**：DSH 忙时由**你**按任务关系选，服务器不猜急迫程度：
+  - `queue`（默认）：排进官方原生 FIFO，当前任务完成后执行；忙时也可靠接收。每个任务独立 taskId/requestId/回合/结果。
+  - `steer`：**补充/纠正当前任务**时用，插进父任务的当前回合（同 turn 消费）。**必须显式给父任务**：
+    `dsh-task --in "<补充>" --session <id> --origin <对话id> --parent <父taskId> [--expected-turn N]`；
+    MCP: `dsh_task { deliver: "steer", parentTaskId, expectedTurn }`。父必须同 origin/同会话**正在执行**；父未开始/已结束/来源不符/回合不符 → 零投递拒绝。
+  - 回执语义：有独立 taskId 与 `observedTurn`，`resultScope=parent-task`；**不等于**父任务结果，也**不签发/扩大**父 grant、不自动决定旧 pending。回执 `receipt-unconfirmed` 表示"官方已接收但没观察到落进父回合"——**不要重发**；父任务结果查 `--status <父taskId> --origin <id> --status-wait`。
+  - CLI/MCP/**DSH 原生工具**都会校验控制凭据（steer 改动既有任务）：CLI/MCP 自动带 `X-Dsh-Control` 头，原生工具只读**本机已有**可信 key（绝不接受调用方传入的 raw key）；缺 key/坏 key → **零插入**。普通非委托 queue 不增加凭据前提。旧网关缺 `capabilities.delivery` → 零派活拒绝。
+
 ## 故障排查
+
+- **模型选择（第五轮，`model:auto` 为默认）**：派活时**不用**再猜固定型号——插件会从本机**已注册** provider 目录里选并回显：
+  - 缺省/`--model auto`：按真实能力（模态/上下文/effort 兼容）+ DeepSeek 偏好 + 任务类型自动选；`fast`/`pro` 仍是兼容偏好；`--model default` 表示**继承**当前选择（不覆盖）。
+  - `--model <精确id> [--provider <p>]`：精确指定；同一模型名在多个 provider 出现时**必须**给 `--provider`，否则拒绝并列出候选。精确指定默认**不**自动降级，要降级须显式 `--model-fallback`；`--no-model-fallback` 可显式关闭。
+  - 只读目录：`dsh-task --models`（或 MCP `dsh_models`）列出候选 pair、目录失败隔离、已知临时失效与冷却；**目录可见 ≠ 凭据/额度/远端健康已验证**，也没有质量/价格评分。
+  - 失效切换边界：只按**稳定 failure.code** 分类；认证/额度/模型失效可切，限流/网络先有界重试再切；**用户取消、拒答/安全、审批拒绝、工具错误、未知插件异常都不切**。默认最多 3 个不同候选，且同 turn/step 内恢复（不重派提示、不丢已执行工具、不新建子代理）。
+  - 任务状态可查 `route`（实际选择/模式/是否允许降级）与 `routeAudit`（切换次数/原因/终态，跨重启保留；只存稳定 code，无正文/密钥）。
+  - **评审与编码同一契约**：`dsh_review` / `review.mjs` / 原生 `dsh_collab_review` 默认也是 `auto`（优先 DeepSeek），同样支持 `--model/--provider/--model-fallback`；`review.mjs` 还要求**显式来源**（`--origin` 或本次调用的 `CODEX_THREAD_ID`）并逐次 status 核对来源，旧网关遇到模型新语义**零派活**拒绝。`--session`/`--find`/`--cwd` 三种目标的模型参数都成对发送（`provider+model` 是一对身份，不允许只发一半）。
 
 - 连接失败：DeepSeek Harness 未运行（网关应监听本机端口，默认 3080；挂在 web/desktop profile 时也可能就是 GUI 的端口）。
 - 派 session 任务返回 `session-writer-held` / `session-busy`：那条会话被别的写入方或另一个 bridge 任务占用；稍后重试，或改用 worker 目标。

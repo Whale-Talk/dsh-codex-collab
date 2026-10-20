@@ -121,14 +121,25 @@ const foldRecords = (events) => {
         error: undefined,
         reason: undefined,
         stopReason: undefined,
+        // 投递控制（第四轮）：父关系/投递模式是**不可变关系**，在 bind 时就落盘（不能等执行后补）。
+        deliver: event.deliver,
+        parentTaskId: event.parentTaskId,
+        resultScope: event.resultScope,
+        requestSeq: event.requestSeq,
+        receiptState: event.receiptState,
+        route: event.route,
+        routePolicy: event.routePolicy,
       })
       continue
     }
     if (event.type === 'update') {
       const record = records.get(event.taskId)
       if (record === undefined) continue
-      for (const key of ['status', 'delivered', 'result', 'error', 'reason', 'stopReason', 'requestId', 'dshTurn']) {
-        if (event[key] !== undefined) record[key] = event[key]
+      for (const key of ['status', 'delivered', 'result', 'error', 'reason', 'stopReason', 'requestId', 'dshTurn', 'deliver', 'parentTaskId', 'receiptState', 'observedTurn', 'resultScope', 'requestSeq', 'route', 'routePolicy', 'routeStopReason']) {
+        if (event[key] === undefined) continue
+        // 显式 null = **清除**（回执绝不允许残留父任务的 result/reason 等旧值）
+        if (event[key] === null) { delete record[key]; continue }
+        record[key] = event[key]
       }
       record.updatedAt = event.at
     }
@@ -182,7 +193,7 @@ export const openAssociations = (options = {}) => {
      * 登记一条关联。**必须在执行前调用**：写盘失败就抛错，让调用方放弃启动 DSH 执行
      * （绝不出现"执行了却没绑定"）。
      */
-    bind({ originThreadId, taskId, kind, target, delivered }) {
+    bind({ originThreadId, taskId, kind, target, delivered, deliver, parentTaskId, resultScope, requestSeq, receiptState, route, routePolicy }) {
       if (!isValidOrigin(originThreadId)) {
         throw fail(ASSOC_REASONS.INVALID_ORIGIN, 'originThreadId must be a non-empty string of at most ' + MAX_ORIGIN_LENGTH + ' characters without control characters')
       }
@@ -204,6 +215,15 @@ export const openAssociations = (options = {}) => {
           profile,
           status: 'accepted',
           delivered: delivered === true ? true : undefined,
+          // 不可变父关系 / 投递模式（第四轮 A）：执行前就落盘，重启后仍在
+          deliver: deliver === 'steer' || deliver === 'queue' ? deliver : undefined,
+          parentTaskId: typeof parentTaskId === 'string' && parentTaskId !== '' ? parentTaskId : undefined,
+          resultScope: typeof resultScope === 'string' ? resultScope : undefined,
+          requestSeq: typeof requestSeq === 'number' ? requestSeq : undefined,
+          receiptState: typeof receiptState === 'string' ? receiptState : undefined,
+          // 模型路由（第一版验收修正）：派活前就落盘的选择/策略（重启后可按 origin+task 取回）
+          route: route !== null && typeof route === 'object' ? route : undefined,
+          routePolicy: routePolicy !== null && typeof routePolicy === 'object' ? routePolicy : undefined,
           at,
         })
         return load().get(taskId)
@@ -222,12 +242,24 @@ export const openAssociations = (options = {}) => {
           taskId,
           status: typeof patch.status === 'string' ? patch.status : undefined,
           delivered: patch.delivered === undefined ? undefined : patch.delivered === true,
-          result: typeof patch.result === 'string' ? patch.result : undefined,
-          error: typeof patch.error === 'string' ? patch.error : undefined,
-          reason: typeof patch.reason === 'string' ? patch.reason : undefined,
-          stopReason: typeof patch.stopReason === 'string' ? patch.stopReason : undefined,
+          result: patch.result === null ? null : (typeof patch.result === 'string' ? patch.result : undefined),
+          error: patch.error === null ? null : (typeof patch.error === 'string' ? patch.error : undefined),
+          reason: patch.reason === null ? null : (typeof patch.reason === 'string' ? patch.reason : undefined),
+          stopReason: patch.stopReason === null ? null : (typeof patch.stopReason === 'string' ? patch.stopReason : undefined),
           requestId: typeof patch.requestId === 'string' ? patch.requestId : undefined,
           dshTurn: typeof patch.dshTurn === 'number' ? patch.dshTurn : undefined,
+          // 投递控制（第四轮 A）：投递模式与父/回执关系（持久化，重启后仍能查）；
+          // `null` = 显式清除（回执绝不允许残留父任务的旧 result/reason）。
+          deliver: patch.deliver === 'steer' || patch.deliver === 'queue' ? patch.deliver : undefined,
+          parentTaskId: patch.parentTaskId === null ? null : (typeof patch.parentTaskId === 'string' ? patch.parentTaskId : undefined),
+          receiptState: patch.receiptState === null ? null : (typeof patch.receiptState === 'string' ? patch.receiptState : undefined),
+          observedTurn: patch.observedTurn === null ? null : (typeof patch.observedTurn === 'number' ? patch.observedTurn : undefined),
+          resultScope: patch.resultScope === null ? null : (typeof patch.resultScope === 'string' ? patch.resultScope : undefined),
+          requestSeq: patch.requestSeq === null ? null : (typeof patch.requestSeq === 'number' ? patch.requestSeq : undefined),
+          // 模型路由（第一版验收修正）：选择/策略/终止原因随任务落盘（重启后按 origin+task 可取回）
+          route: patch.route === null ? null : (patch.route !== null && typeof patch.route === 'object' ? patch.route : undefined),
+          routePolicy: patch.routePolicy === null ? null : (patch.routePolicy !== null && typeof patch.routePolicy === 'object' ? patch.routePolicy : undefined),
+          routeStopReason: patch.routeStopReason === null ? null : (typeof patch.routeStopReason === 'string' ? patch.routeStopReason : undefined),
           at: Date.now(),
         })
         return load().get(taskId)

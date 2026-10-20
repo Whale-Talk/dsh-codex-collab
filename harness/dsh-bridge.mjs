@@ -19,6 +19,8 @@
  * 与动态插件版本的关键差异：宿主插件运行在完整 Node 环境，
  * AbortSignal 可用，因此 followup 的 cold-resume 路径不再降级。
  */
+import fs from 'node:fs'
+import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
   ASSOC_REASONS,
@@ -26,6 +28,10 @@ import {
   openAssociations,
 } from './codex-associations.mjs'
 import { rememberTask } from './task-table.mjs'
+import { createAuditTailReader } from './audit-tail.mjs'
+import { createSessionObservationHub } from './session-observer.mjs'
+import { createModelRouting } from './model-route-host.mjs'
+import { DEFAULT_ROUTE_LIMITS } from './model-routing.mjs'
 import {
   REASONS,
   textOfBlocks,
@@ -44,7 +50,23 @@ import {
   consumeSessionEvent,
   consumeSnapshotFrame,
   turnOutcome,
+  openTurnsOf,
+  currentOpenTurn,
+  turnHasEnded,
+  findRequestEvidence,
 } from './session-target.mjs'
+import {
+  APPROVAL_REASONS,
+  APPROVAL_STATES,
+  DECISIONS,
+  MAX_AUTHORIZED_TTL_MS,
+  controlCredDigest,
+  keyFingerprint8,
+  openApprovalStore,
+  readControlKey,
+  verifyControlHeader,
+  controlKeyPath,
+} from './codex-approvals.mjs'
 
 export const name = 'dsh-bridge'
 
@@ -65,6 +87,12 @@ export async function apply(ctx) {
   // 在 apply() 时捕获会永久拿到 undefined。每次使用时现取；缺失时返回稳定的
   // session-controller-unavailable，而不是让整个插件挂掉。
   const sessionControllerNow = () => ctx.get('sessionController')
+  const bridgeVersion = (() => { try { return JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version } catch { return 'unknown' } })()
+  const observations = createSessionObservationHub({
+    ctx, query: () => sessionQuery, controller: sessionControllerNow,
+    liveSession: (id) => ctx.get('sessions')?.get?.(id) || agents?.get?.(id)?.session,
+  })
+  ctx.effect(() => () => observations.close())
 
   // 清理历史版本可能泄漏的路由条目（重启前的动态插件、旧版本次插件）
   try {
@@ -151,6 +179,70 @@ export async function apply(ctx) {
     return {}
   }
 
+  // ---- 动态模型路由（M2）----
+  // 目录/选择/分类逻辑在 model-routing.mjs，宿主 hook 与归属在 model-route-host.mjs；
+  // 这里只负责：策略解析、派活前登记、审计落盘、只读目录路由与能力声明。
+  const routeAuditPath = () => (associations === null || typeof associations.dir !== 'string' ? null : associations.dir + '/model-routing.jsonl')
+  const routeAuditLines = []
+  const appendRouteAudit = (entry) => {
+    routeAuditLines.push(entry)
+    if (routeAuditLines.length > 400) routeAuditLines.shift()
+    const file = routeAuditPath()
+    if (file === null) return
+    try {
+      // 审计目录是 assoc 根下的 namespace 子目录：首次写入前必须建好，否则 appendFileSync 会 ENOENT。
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8')
+    } catch (e) { /* 审计失败绝不影响执行 */ }
+  }
+  const routeAuditReader = createAuditTailReader({ file: routeAuditPath, fallback: () => routeAuditLines })
+  const readRouteAudit = (taskId, limit) => routeAuditReader.read(taskId, limit)
+  const modelRouting = createModelRouting({
+    ctx,
+    llm,
+    agents: () => (typeof agents !== 'undefined' ? agents : undefined),
+    // 官方选择意图（`model/selection`）用真实会话日志判定：同值的人工重选也必须被尊重
+    readSessionEvents: (sessionId) => readSessionEvents(sessionId),
+    // 默认选择只读快照（绝不用它写任何配置）
+    selectionOf: () => {
+      const base = pickModelOptions()
+      return typeof base.provider === 'string' && typeof base.model === 'string' ? { provider: base.provider, model: base.model } : null
+    },
+    baseSelection: (() => { const base = pickModelOptions(); return typeof base.provider === 'string' && typeof base.model === 'string' ? { provider: base.provider, model: base.model } : null })(),
+    audit: appendRouteAudit,
+    limits: DEFAULT_ROUTE_LIMITS,
+  })
+  const uninstallModelRouting = modelRouting.install()
+  // 插件卸载 → hook 与绑定全部失效（在途异步返回不得复活策略）
+  ctx.effect(() => () => { try { uninstallModelRouting() } catch (e) { /* ignore */ } })
+
+  /**
+   * 把调用方的模型输入解析成任务级策略（第四次交付契约）：
+   *  - 缺省/`auto` → auto（默认）；`fast`/`pro` → 兼容偏好；`default` → inherit；
+   *  - 给了精确 model（非别名）→ exact（provider 可选，缺省时同名歧义会被拒绝并给候选）；
+   *  - `modelFallback` 显式 false 即关闭；精确指定默认关闭（调用方显式 true 才允许降级）。
+   */
+  const parseRoutePolicy = (parsed) => {
+    const rawModel = typeof parsed.model === 'string' && parsed.model.trim() !== '' ? parsed.model.trim() : (typeof parsed.modelAlias === 'string' ? parsed.modelAlias.trim() : '')
+    const provider = typeof parsed.provider === 'string' && parsed.provider.trim() !== '' ? parsed.provider.trim() : undefined
+    const explicitFallback = parsed.modelFallback === undefined ? undefined : parsed.modelFallback === true
+    let mode = 'auto'
+    let model
+    if (rawModel === 'fast' || rawModel === 'pro') mode = rawModel
+    else if (rawModel === 'default' || rawModel === '') mode = rawModel === 'default' ? 'inherit' : 'auto'
+    else if (rawModel === 'auto') mode = 'auto'
+    else { mode = 'exact'; model = rawModel }
+    if (mode === 'inherit') return { mode, provider: undefined, model: undefined, allowFallback: explicitFallback === true, taskKind: parsed.taskKind }
+    return {
+      mode,
+      provider: mode === 'exact' ? provider : undefined,
+      model: mode === 'exact' ? model : undefined,
+      // auto/fast/pro 默认允许切换；精确指定默认固定，除非调用方显式开启
+      allowFallback: explicitFallback === undefined ? (mode !== 'exact') : explicitFallback,
+      taskKind: typeof parsed.taskKind === 'string' ? parsed.taskKind : 'code',
+    }
+  }
+
   // ---- model alias resolution ----
   const modelAliasCache = new Map()
   let knownModels = []
@@ -218,6 +310,15 @@ export async function apply(ctx) {
   const projectStoredTask = (record) => {
     const liveTask = tasks.find((t) => t.taskId === record.taskId)
     const terminal = record.status === 'done' || record.status === 'error' || record.status === 'cancelled'
+    // 投递控制（第四轮 A）：父关系/投递模式/回执证据是**不可变事实**，所有投影都必须带上。
+    const deliveryFields = {
+      ...(record.deliver === undefined ? {} : { deliver: record.deliver }),
+      ...(record.parentTaskId === undefined ? {} : { parentTaskId: record.parentTaskId }),
+      ...(record.receiptState === undefined ? {} : { receiptState: record.receiptState }),
+      ...(record.observedTurn === undefined ? {} : { observedTurn: record.observedTurn }),
+      ...(record.resultScope === undefined ? {} : { resultScope: record.resultScope }),
+      ...(record.requestSeq === undefined ? {} : { requestSeq: record.requestSeq }),
+    }
     const base = {
       taskId: record.taskId,
       originThreadId: record.originThreadId,
@@ -228,14 +329,44 @@ export async function apply(ctx) {
       live: liveTask !== undefined,
       ...(record.requestId === undefined ? {} : { requestId: record.requestId }),
       ...(record.dshTurn === undefined ? {} : { dshTurn: record.dshTurn }),
+      ...deliveryFields,
     }
     if (liveTask !== undefined) {
       return {
         ...base,
         status: liveTask.status,
+        deliver: liveTask.deliver,
+        ...(liveTask.receiptState === undefined ? {} : { receiptState: liveTask.receiptState }),
+        ...(liveTask.observedTurn === undefined ? {} : { observedTurn: liveTask.observedTurn }),
+        ...(liveTask.parentTaskId === undefined ? {} : { parentTaskId: liveTask.parentTaskId }),
+        ...(liveTask.resultScope === undefined ? {} : { resultScope: liveTask.resultScope }),
         ...(liveTask.result === undefined ? {} : { result: liveTask.result }),
         ...(liveTask.error === undefined ? {} : { error: liveTask.error }),
         ...(liveTask.delivered === undefined ? {} : { delivered: liveTask.delivered }),
+      }
+    }
+    // 回执的"自身已被观察到"是**独立于父任务执行**的持久事实：重启后不能降级成 unknown。
+    if (record.deliver === 'steer' && record.receiptState === 'observed') {
+      return {
+        ...base,
+        status: 'receipt-observed',
+        receiptState: 'observed',
+        resultScope: record.resultScope === undefined ? 'parent-task' : record.resultScope,
+        ...(record.observedTurn === undefined ? {} : { observedTurn: record.observedTurn }),
+        ...(record.delivered === undefined ? {} : { delivered: record.delivered }),
+        note: '补充回执已被官方回合接收并观察到（自身证据）；父任务的执行结果请查父 task（本回执不承载父结果）。',
+      }
+    }
+    if (record.deliver === 'steer' && record.receiptState !== undefined && record.receiptState !== 'observed') {
+      // 回执已接收但未观察到/已偏离：同样是持久事实，不重发。
+      return {
+        ...base,
+        status: record.status === 'receipt-deviated' ? 'receipt-deviated' : (record.status === 'receipt-unconfirmed' ? 'receipt-unconfirmed' : 'receipt-pending'),
+        receiptState: record.receiptState,
+        resultScope: record.resultScope === undefined ? 'parent-task' : record.resultScope,
+        ...(record.observedTurn === undefined ? {} : { observedTurn: record.observedTurn }),
+        resend: false,
+        note: '回执已提交但未（或未按目标回合）观察到自身 rpcId 落进父回合；**不要重发**，父任务结果请查父 task。',
       }
     }
     if (terminal) {
@@ -308,11 +439,69 @@ export async function apply(ctx) {
   }
 
   /** 能力上报：客户端在**派活前**只读核验本网关是否真的支持持久来源绑定（旧网关没有这一块）。 */
-  const capabilityReport = () => ({
-    originBinding: associations === null
+  const capabilityReport = () => {
+    const originBinding = associations === null
       ? { supported: false, version: 0, reason: 'association-store-unavailable' }
-      : { supported: true, version: 1, persistence: 'append-only-jsonl', namespace: associations.namespace },
-  })
+      : { supported: true, version: 1, persistence: 'append-only-jsonl', namespace: associations.namespace }
+    const key = readControlKey()
+    return {
+      originBinding,
+      approvals: approvalStore === null
+        ? { supported: false, enabled: false, reason: 'approval-store-unavailable', canWakeIdle: false }
+        : {
+            // supported=官方接缝可用；enabled=key 在位（缺 key 整条能力默认关闭）
+            supported: true,
+            enabled: key !== null,
+            ...(key === null ? {} : { keyFp: keyFingerprint8(key) }),
+            requiresExplicitEnable: true,   // 委托必须按任务显式开启，提示/文本不构成授权
+            requiresKeyHeader: 'X-Dsh-Control',   // 私有 raw key（服务端只存域分离单向摘要）
+            activeOnly: true,               // 只在 Codex 活跃循环内生效
+            workerSupported: false,         // worker child 身份未证明 → 委托派活会被拒绝
+            ptcSupported: false,            // PTC callId/root 未证明 → 嵌套调用直接 next()
+            sessionTargetSupported: true,   // 已证明：req.agent.session.id 严格绑定
+            canWakeIdle: false,
+          },
+      // 动态模型路由（M2）：真实 scope/能力声明；新客户端用新参数前必须只读预检这一段。
+      modelRouting: {
+        supported: true,
+        version: 1,
+        defaultMode: 'auto',
+        modes: ['auto', 'fast', 'pro', 'inherit', 'exact'],
+        providerModelPairIdentity: true,
+        catalogDiscovery: true,
+        metadataHasNoQualityOrPriceScore: true,
+        firstRequestBinding: 'agent/inbox/claimed',
+        runtimeSwitch: {
+          supported: true,
+          sameTurnStep: true,
+          via: 'agent/request+agent/request-error',
+          boundedCandidates: DEFAULT_ROUTE_LIMITS.maxCandidates,
+        },
+        workerFirstRequest: 'spec.childId+live-registry-equality',
+        // 诚实：worker 首请求绑定依赖 provider 真正接受 spec.childId 且 claim 报出同一 agent id；
+        // 只有在一次真实 claim 命中后才有证据，因此默认声明**未证明**。
+        workerFirstRequestProven: false,
+        // worker 后续任务沿用**同一个 durable child**（warm 复用 / cold 官方恢复），入口是官方
+        // `subagents.prompt({mode:'continuable',delivery:'queue',requestId})`；不存在 `subagents.followup`。
+        workerContinuation: 'subagents.prompt(continuable,queue)',
+        workerContinuationProven: false,
+        maxCandidates: DEFAULT_ROUTE_LIMITS.maxCandidates,
+        limits: { ...DEFAULT_ROUTE_LIMITS },
+        structuredCodesOnly: true,
+        note: '只枚举已注册配置；目录可见不等于凭据/额度/远端健康已验证，也没有质量/价格/速度评分。',
+      },
+      // 投递控制（第四轮）：queue 走官方原生 FIFO（一次 claim 一条 next-turn）；steer 是父任务的补充回执。
+      // 新字段（deliver=steer / parentTaskId / expectedTurn）遇到没有这段能力的旧网关 → 客户端零派活拒绝。
+      delivery: {
+        supported: true,
+        defaultMode: 'queue',
+        modes: ['queue', 'steer'],
+        queue: { supported: true, multiTaskPerSession: true, nativeFifo: true, oneTurnPerClaim: true, independentRequestId: true },
+        steer: { supported: true, requiresParentTaskId: true, requiresOrigin: true, requiresControlAuth: true, sameTurnAsParent: true, resultScope: 'parent-task', boundedReceiptMs: RECEIPT_OBSERVE_TIMEOUT_MS },
+        maxConcurrentPerSession: null,   // 不人为限制；由官方队列顺序决定
+      },
+    }
+  }
 
   /**
    * 执行前登记关联。失败即返回错误，调用方必须放弃启动 DSH 执行——
@@ -324,7 +513,17 @@ export async function apply(ctx) {
       return { ok: false, reason: 'association-store-unavailable', message: 'the task association store could not be opened in this gateway; refusing to dispatch an origin-bound task' }
     }
     try {
-      associations.bind({ originThreadId, taskId: task.taskId, kind: task.kind, target: task.target })
+      associations.bind({
+        originThreadId, taskId: task.taskId, kind: task.kind, target: task.target,
+        // 不可变父关系 / 投递模式：**执行前**就落盘（第四轮 A）
+        deliver: task.deliver,
+        parentTaskId: task.parentTaskId,
+        resultScope: task.resultScope,
+        requestSeq: task.requestSeq,
+        receiptState: task.receiptState,
+        route: task.route,
+        routePolicy: task.routePolicy,
+      })
       task.originThreadId = originThreadId
       return { ok: true }
     } catch (e) {
@@ -339,19 +538,347 @@ export async function apply(ctx) {
       associations.update(task.taskId, {
         status: task.status,
         delivered: task.delivered,
-        result: task.result,
-        error: task.error,
+        // 回执绝不允许把父任务的旧 result/error 留在落盘记录里（显式 null = 清除）。
+        result: task.deliver === 'steer' ? null : task.result,
+        error: task.deliver === 'steer' ? null : task.error,
         reason: task.reason,
         stopReason: task.stopReason,
         requestId: task.requestId,
         dshTurn: task.dshTurn,
+        // 投递控制（第四轮 A）：父关系/投递模式/回执证据必须随每次落盘一起写，否则重启后全丢。
+        deliver: task.deliver,
+        parentTaskId: task.parentTaskId,
+        receiptState: task.receiptState,
+        observedTurn: task.observedTurn,
+        resultScope: task.resultScope,
+        requestSeq: task.requestSeq,
+        // 模型路由（第一版验收修正）：选择与策略随任务落盘，**重启后同 origin/task 仍可取回**
+        route: task.route,
+        routePolicy: task.routePolicy,
+        ...(task.routeStopReason === undefined ? {} : { routeStopReason: task.routeStopReason }),
       })
       delete task.associationError
+      // 模型路由收口（M2）：终态**一次**收口（清绑定、落审计）；在途异步返回不得复活策略。
+      if ((task.status === 'done' || task.status === 'error' || task.status === 'cancelled') && task.routeFinished !== true) {
+        task.routeFinished = true
+        try { modelRouting.finishRoute({ taskId: task.taskId, status: task.status, reason: task.reason }) } catch (e) { /* ignore */ }
+      }
     } catch (e) {
       // 明确暴露，绝不静默：任务本身的结果不受影响，但调用方能在状态里看到关联写入失败。
       task.associationError = errText(e)
       console.error('[dsh-bridge] association update failed for', task.taskId, ':', errText(e).slice(0, 200))
     }
+  }
+
+  // ================================================================ 审批委托（M1/M2，独立验收修正版）
+
+  /** 审批存储：打开失败即能力关闭（capabilities.approvals.enabled=false，审批路由全 401）。 */
+  const approvalStore = (() => {
+    try {
+      return openApprovalStore({ root: process.env.DSH_APPROVAL_DIR, lockTimeoutMs: 10_000 })
+    } catch (e) {
+      console.error('[dsh-bridge] approval store unavailable:', errText(e).slice(0, 200))
+      return null
+    }
+  })()
+
+  /**
+   * 每次请求重读 key（支持轮换）。返回的是**域分离单向摘要**（`digest:…`），
+   * 只用于 grant 绑定与审计；它**不能**用于认证（修正 C）。
+   */
+  const approvalCredDigest = () => {
+    const key = readControlKey()
+    return key === null ? null : controlCredDigest(key)
+  }
+
+  /** 审批类路由鉴权：`X-Dsh-Control` = 私有 raw key，与服务端读到的 key 等值比较。失败零副作用、不回显头。 */
+  const approvalAuth = (req) => {
+    if (approvalStore === null) return { ok: false, reason: 'approval-store-unavailable' }
+    const key = readControlKey()
+    if (key === null) return { ok: false, reason: APPROVAL_REASONS.NO_KEY }
+    const header = req.headers !== undefined && req.headers !== null ? req.headers['x-dsh-control'] : undefined
+    if (!verifyControlHeader(header, key)) return { ok: false, reason: APPROVAL_REASONS.BAD_HEADER }
+    return { ok: true, credDigest: controlCredDigest(key) }
+  }
+
+  /**
+   * **原生入口**（宿主进程内）的鉴权（第二次验收修正 1）：没有 HTTP 头，但绝不能因此变成"无鉴权"。
+   * 判据与 HTTP 完全一致——只读**本机已有**的可信控制 key（不接收、不回显、不新增任何凭据/token，
+   * 也绝不让模型提供 raw key）：缺 key → no-key；key 存在但格式非法 → bad-header；两者都**零派活**。
+   */
+  const nativeControlAuth = () => {
+    if (approvalStore === null) return { ok: false, reason: 'approval-store-unavailable' }
+    const key = readControlKey()
+    if (key === null) {
+      // 区分"根本没有 key 文件"（能力关闭）与"文件在但格式非法"（坏 key），两者都零派活。
+      let raw = null
+      try {
+        const file = controlKeyPath()
+        if (typeof file === 'string' && file !== '') raw = fs.readFileSync(file, 'utf8')
+      } catch (e) { raw = null }
+      if (raw !== null && typeof raw === 'string' && raw.trim() !== '') return { ok: false, reason: APPROVAL_REASONS.BAD_HEADER }
+      return { ok: false, reason: APPROVAL_REASONS.NO_KEY }
+    }
+    // 复用与 HTTP 相同的格式/等值校验（内部调用把 key 同时当"服务端 key"和"来头值"）。
+    if (!verifyControlHeader(key, key)) return { ok: false, reason: APPROVAL_REASONS.BAD_HEADER }
+    return { ok: true, credDigest: controlCredDigest(key) }
+  }
+
+  /** PTC 嵌套子调用判别器（dsh-tools:1298 `<parentCallId>:ptc:<n>`）：未证明 → 不接手。 */
+  const isPtcNestedCall = (callId) => typeof callId === 'string' && /:ptc:\d+$/.test(callId)
+
+  /** 读该会话的日志事件（失败/不可用 → null）。 */
+  const readSessionEvents = (sessionId) => observations.evidence(sessionId)
+
+  /**
+   * turn/step 证明（修正 A/D）：必须来自日志里**同一个 callId 的 `tool/call`**，且 turn 与 step **都是整数**。
+   * 找不到、或只有 turn 没有 step → null（调用方 next()）。**未知 turn/step 绝不能作为可批准默认值。**
+   */
+  const resolveTurnStepFrom = (events, callId) => {
+    if (!Array.isArray(events)) return null
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i]
+      if (event === null || typeof event !== 'object') continue
+      if (event.type !== 'tool/call') continue
+      const data = event.data !== null && typeof event.data === 'object' ? event.data : {}
+      if (data.callId !== callId) continue
+      if (!Number.isInteger(data.turn) || !Number.isInteger(data.step)) return null
+      return { turn: data.turn, step: data.step, turnSource: 'log-tool-call', stepSource: 'log' }
+    }
+    return null
+  }
+
+  /** 该 session+task+origin 上「未撤销、未过绝对 TTL、凭据摘要匹配」的 grant（租约由等待/决定路径校验）。 */
+  const grantForTask = ({ sessionId, taskId, originThreadId, credDigest }) => {
+    if (approvalStore === null || credDigest === null) return null
+    const now = Date.now()
+    for (const g of approvalStore.listGrants({ sessionId, taskId, originThreadId, activeOnly: true })) {
+      if (now > g.expiresAt) continue
+      const check = approvalStore.validateGrant({ grantId: g.grantId, taskId, originThreadId, sessionId, credDigest }, { ignoreLease: true })
+      if (check.ok === true) return check.grant
+    }
+    return null
+  }
+
+  /**
+   * **认证活跃委托窗口**（第二轮修正 blocker 3）：只有"仍有效（未撤销/未过绝对 TTL）、凭据摘要匹配、
+   * 且严格属于该 task/origin/session"的 grant 才能延长观察窗口——这就是"认证活跃"。
+   * 失联（本机 key 没了）→ approvalCredDigest() 为 null → 退回旧预算；撤销/到期 → 同样退回。
+   * 注意：不看 lease（慢模型在第一个 ask 之前不该被初始租约卡死），只看 grant 的绝对有效期。
+   */
+  const activeDelegatedGrantFor = (task) => {
+    if (approvalStore === null || task === undefined || task === null) return null
+    if (task.target === undefined || task.target.kind !== 'session') return null
+    if (typeof task.originThreadId !== 'string' || task.originThreadId === '') return null
+    const credDigest = approvalCredDigest()
+    if (credDigest === null) return null
+    const grant = task.grantId !== undefined
+      ? approvalStore.validateGrant({ grantId: task.grantId, taskId: task.taskId, originThreadId: task.originThreadId, sessionId: task.target.sessionId, credDigest }, { ignoreLease: true })
+      : { ok: false }
+    const resolved = grant.ok === true
+      ? grant.grant
+      : grantForTask({ sessionId: task.target.sessionId, taskId: task.taskId, originThreadId: task.originThreadId, credDigest })
+    if (resolved === undefined || resolved === null || resolved === false) return null
+    if (Date.now() > resolved.expiresAt) return null
+    return { grantId: resolved.grantId, until: resolved.expiresAt }
+  }
+
+  /** 观察预算：无委托=旧语义；有认证活跃委托=以 grant 绝对到期为界（另加宽限与硬上限，仍是有界的）。 */
+  const observationBudgetMs = (record, delegated) => {
+    if (delegated === null) return SESSION_TOTAL_TIMEOUT_MS
+    const untilGrant = Math.max(0, delegated.until - record.startedAt) + DELEGATED_OBSERVATION_GRACE_MS
+    return Math.min(Math.max(SESSION_TOTAL_TIMEOUT_MS, untilGrant), MAX_DELEGATED_OBSERVATION_MS)
+  }
+
+  /**
+   * 该任务当前的 grant 视图（**非秘密**：id/状态/期限），用于 status 响应与客户端自适应续租。
+   * 只回属于本任务/来源/会话的 grant；raw key 与摘要绝不出现。
+   */
+  const delegatedGrantView = (task) => {
+    if (approvalStore === null || task === undefined || task === null) return null
+    if (typeof task.grantId !== 'string' || task.grantId === '') return null
+    const grant = approvalStore.getGrant(task.grantId)
+    if (grant === undefined || grant === null) return null
+    return { grantId: grant.grantId, status: grant.status, expiresAt: grant.expiresAt, leaseUntil: grant.leaseUntil }
+  }
+
+  /** 给**该 grant 的 task** 标 needs-approval（修正 D：不再按 session 找任意活任务）。 */
+  const markNeedsApproval = (task, pending) => {
+    if (task === undefined || task === null) return undefined
+    task.status = 'needs-approval'
+    const keys = Array.isArray(task.approvalKeys) ? task.approvalKeys.slice() : []
+    if (!keys.includes(pending.approvalKey)) keys.push(pending.approvalKey)
+    task.approvalKeys = keys
+    task.approvalPendingCount = approvalStore.liveCountForTask(task.taskId)
+    pushTask(task.taskId, 'approval', {
+      approvalKey: pending.approvalKey, toolName: pending.toolName, taskId: task.taskId,
+      target: task.target, approvalState: APPROVAL_STATES.PENDING,
+    })
+    return task
+  }
+
+  /** 决定返回后：**还有别的未决就保持 needs-approval**（修正 E），最后一条解决才回 running。 */
+  const restoreAfterDecision = (task) => {
+    if (task === undefined || task === null || approvalStore === null) return
+    if (task.status !== 'needs-approval') return
+    const live = approvalStore.liveCountForTask(task.taskId)
+    task.approvalPendingCount = live
+    if (live > 0) return
+    task.status = 'running'
+    pushTask(task.taskId, 'approval-done', { taskId: task.taskId, approvalPendingCount: 0 })
+  }
+
+  /** 官方词汇映射：只有官方 decided 的 allowed-once 才算批准。 */
+  const outcomeOfPending = (pending) => {
+    switch (pending.state) {
+      case APPROVAL_STATES.CONFIRMED: return 'allowed-once'
+      case APPROVAL_STATES.CANCELLED: return 'cancelled'
+      case APPROVAL_STATES.REJECTED: return 'rejected'
+      case APPROVAL_STATES.SUBMITTED: return pending.outcome    // 已提交但官方 decided 尚未观测到
+      case APPROVAL_STATES.DECISION_UNKNOWN: return undefined
+      default: return undefined                                  // expired/context-changed/superseded/ambiguous → 交人工
+    }
+  }
+
+  /**
+   * 等待决定（修正 E）：按**有效租约/绝对 TTL 与 req.signal** 保持（不再有 25s 硬上限；
+   * 25s 只是"单次 HTTP/MCP 调用"的有界等待，不能套在真实 SDK callback 上）。
+   * 认证续租/续期会移动 lease/expiry；撤销/过期/上下文变化/信号中止立刻收口。
+   * **退出前一定关闭可答状态**，交还 next() 之后迟到的批准不可能再被接受。
+   */
+  const waitForDecision = async (pending, req) => {
+    let lastIdentityCheck = 0
+    for (;;) {
+      const current = approvalStore.getPending(pending.approvalKey)
+      if (current === undefined) return undefined
+      if (current.state !== APPROVAL_STATES.PENDING) return outcomeOfPending(current)
+      const signal = req.signal
+      if (signal !== undefined && signal !== null && signal.aborted) {
+        approvalStore.closePending(pending.approvalKey, APPROVAL_STATES.CANCELLED, 'request signal aborted')
+        return 'cancelled'
+      }
+      const check = approvalStore.validateGrant({
+        grantId: pending.grantId, taskId: pending.taskId, originThreadId: pending.originThreadId,
+        sessionId: pending.sessionId, credDigest: approvalCredDigest(),
+      })
+      if (check.ok !== true) {
+        approvalStore.closePending(pending.approvalKey, APPROVAL_STATES.EXPIRED, 'grant no longer valid: ' + check.reason)
+        return undefined
+      }
+      // 完整执行身份（第二轮）：coarse snapshotId + **日志里当前 turn/step**，任一变化 → 收口交还人工。
+      // 日志重读按 ~1s 节流（等待本身要保持轻量）。
+      if (Date.now() - lastIdentityCheck >= 1000) {
+        lastIdentityCheck = Date.now()
+        const live = approvalStore.getSnapshot(pending.sessionId, pending.callId)
+        if (live === undefined || live.snapshotId !== pending.snapshotId) {
+          approvalStore.closePending(pending.approvalKey, APPROVAL_STATES.CONTEXT_CHANGED, 'live execution snapshot changed while pending')
+          return undefined
+        }
+        const events = await readSessionEvents(pending.sessionId)
+        const currentSnapshot = approvalStore.getSnapshot(pending.sessionId, pending.callId)
+        const currentTurnStep = events === null ? null : resolveTurnStepFrom(events, pending.callId)
+        if (currentTurnStep === null) {
+          approvalStore.closePending(pending.approvalKey, APPROVAL_STATES.CONTEXT_CHANGED, 'current turn/step can no longer be proven for this call')
+          return undefined
+        }
+        if (currentSnapshot === undefined || approvalStore.executionIdentity(currentSnapshot, currentTurnStep) !== pending.executionId) {
+          approvalStore.closePending(pending.approvalKey, APPROVAL_STATES.CONTEXT_CHANGED, 'execution identity changed while pending (tool/root/parent/step/args)')
+          return undefined
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+
+  /**
+   * 正式 answerer：严格谓词不成立一律返回 undefined → 调用方立刻 `next()`（不吞人工/其它 answerer）。
+   * 内部异常同样走 next()——绝不 throw：官方 decide 会把 throw 归一成 unavailable，那会跳过人工链。
+   */
+  const handleApprovalRequest = async (req) => {
+    if (approvalStore === null) return undefined
+    if (req === null || typeof req !== 'object') return undefined
+    if (typeof req.callId !== 'string' || req.callId === '') return undefined            // 无 callId → next()（ACP 同款）
+    const session = req.agent !== undefined && req.agent !== null ? req.agent.session : undefined
+    const sessionId = session !== undefined && session !== null && typeof session.id === 'string' ? session.id : undefined
+    if (sessionId === undefined) return undefined
+
+    // 投递控制 D1：把日志喂给**该会话所有队列执行记录**（幂等，按 seq 去重），
+    // 然后由"当前开放回合"选出**唯一**执行 owner——steer 回执永不参与审批归属。
+    const events = await readSessionEvents(sessionId)
+    if (events === null) return undefined
+    const candidatesForTurn = []
+    for (const r of queueOwnerRecords(sessionId)) {
+      const ownerTask = taskById(r.taskId)
+      if (ownerTask === undefined || ownerTask.target === undefined || ownerTask.target.kind !== 'session') continue
+      if (typeof ownerTask.originThreadId !== 'string' || ownerTask.originThreadId === '') continue
+      if (r.tracker === undefined) continue
+      for (const event of events) consumeSessionEvent(r.tracker, event)
+      if (r.tracker.sawRequest === true && Number.isInteger(r.tracker.turn)) candidatesForTurn.push({ record: r, task: ownerTask })
+    }
+    // 同一 callId 的真实 turn/step 由日志证明；本轮 owner 必须**恰好一条**（歧义 → 交人工，绝不任选一条活 task）
+    const turnStep = resolveTurnStepFrom(events, req.callId)
+    if (turnStep === null) return undefined
+    // 首次验收修正 E：owner 必须是**当前真实开放**的那个 queue 任务回合。
+    // 只比对历史 tool/call 的 turn 不够——已结束的 A( turn1 ) 会靠旧授权接管 B( turn2 ) 的 ask。
+    const openTurn = currentOpenTurn(events)
+    if (openTurn === null || openTurn !== turnStep.turn) return undefined
+    const owners = candidatesForTurn.filter((c) => c.record.tracker.turn === turnStep.turn && c.record.tracker.end === undefined && c.record.settled !== true)
+    if (owners.length !== 1) return undefined
+    const record = owners[0].record
+    const task = owners[0].task
+    // 自己的回合必须仍然开放（tracker.end 未置位且日志里该 turn 没有 turn/end）
+    if (turnHasEnded(events, openTurn) === true) return undefined
+    const ownTurn = turnStep.turn
+
+    const credDigest = approvalCredDigest()
+    if (credDigest === null) return undefined
+    const grant = grantForTask({ sessionId, taskId: task.taskId, originThreadId: task.originThreadId, credDigest })
+    if (grant === null) return undefined                                                 // 未委托该 task → next()
+
+    const snapshot = approvalStore.getSnapshot(sessionId, req.callId)
+    if (snapshot === undefined) return undefined                                         // 无真实参数快照 → next()
+    if (snapshot.name !== req.toolName) return undefined
+    if (snapshot.identityComplete !== true) return undefined
+    if (isPtcNestedCall(req.callId)) return undefined                                    // PTC 嵌套（未证明）→ next()
+    if (typeof snapshot.rootCallId === 'string' && snapshot.rootCallId !== req.callId) return undefined   // 父子混淆 → next()
+    if (snapshot.parentKey !== null && snapshot.parentKey !== undefined) return undefined // 存在父执行（嵌套未证明）→ next()
+    // 登记官方 asked 身份（不依赖 sweep 先跑过）
+    observeApprovalEvents(sessionId, events)
+    if (approvalStore.annotateSnapshot(sessionId, req.callId, turnStep) === null) return undefined
+    const fresh = approvalStore.getSnapshot(sessionId, req.callId)
+
+    // 官方身份（UUID）必须**唯一认领**：歧义/未观测 → 交人工，绝不猜、绝不按 callId 合并（修正 B）
+    const candidates = approvalStore.unclaimedAskedFor(sessionId, req.callId, req.toolName)
+    if (candidates.length !== 1) return undefined
+
+    const pending = approvalStore.openPending({
+      execution: {
+        snapshotId: fresh.snapshotId, sessionId, callId: req.callId, toolName: req.toolName,
+        rootCallId: fresh.rootCallId, parentKey: fresh.parentKey, cwd: fresh.cwd, cwdSource: fresh.cwdSource,
+        args: fresh.args,
+        turn: fresh.turn, step: fresh.step, turnSource: fresh.turnSource, stepSource: fresh.stepSource,
+      },
+      grant,
+      reason: req.reason,
+      displayReason: req.displayReason,
+      askSeq: approvalStore.askCountFor(sessionId, req.callId) + 1,
+    })
+    // 身份不完整（未知 cwd/父身份等）→ 明确拒绝接手（绝不假装完整）；关键：**不认领官方身份**
+    if (pending === null) return undefined
+    const claimed = approvalStore.claimOfficialAsk(pending.approvalKey, candidates[0].officialId)
+    if (claimed.ok !== true) {
+      approvalStore.closePending(pending.approvalKey, APPROVAL_STATES.AMBIGUOUS, 'official request could not be uniquely claimed')
+      return undefined
+    }
+    const marked = markNeedsApproval(task, pending)
+    const outcome = await waitForDecision(pending, req)
+    if (outcome === undefined) {
+      // 交还人工前先关闭可答状态（迟到批准不可能被接受）
+      approvalStore.closePending(pending.approvalKey, APPROVAL_STATES.SUPERSEDED, 'handed back to the human chain')
+      return undefined
+    }
+    restoreAfterDecision(marked)
+    return outcome
   }
 
   const broadcast = (msg) => {
@@ -458,6 +985,34 @@ export async function apply(ctx) {
     '不要修改任何文件。没有新请求时不要主动输出。',
   ].join('')
 
+  /** 官方 continuable 语义：父/子 **session id** 精确、queue 投递、本次 taskId 作为 requestId（首请求归属靠它）。
+   *  `subagents.prompt` 内部用 `agents.get(parentSessionId)` 找 **live parent Agent** —— 父这一侧是 Agent id。 */
+  const parentSessionIdOf = (agent) => (agent !== null && agent !== undefined && typeof agent.id === 'string' && agent.id !== '' ? agent.id : undefined)
+
+  /**
+   * 继续同一个 durable child（**warm**：live 复用 / **cold**：已自然释放后官方恢复）。
+   * 官方 `subagents.prompt({requestId,parentSessionId,childSessionId,mode:'continuable',delivery:'queue',content},signal)`
+   * 是唯一正确入口（本机 44 个官方包里**没有** `subagents.followup`）；失败时如实报错，绝不 one-shot 另建 child 冒充继续。
+   */
+  const promptChild = async (bucket, parent, requestId, text) => {
+    if (subagents === undefined || subagents === null || typeof subagents.prompt !== 'function') {
+      throw Object.assign(new Error('this host does not expose subagents.prompt (continuable)'), { code: 'WORKER_CONTINUE_UNAVAILABLE' })
+    }
+    const parentSessionId = parentSessionIdOf(parent)
+    const childSessionId = typeof bucket.childSessionId === 'string' && bucket.childSessionId !== '' ? bucket.childSessionId : bucket.childId
+    if (typeof parentSessionId !== 'string' || typeof childSessionId !== 'string' || childSessionId === '') {
+      throw Object.assign(new Error('continuable prompt needs exact parentSessionId and childSessionId'), { code: 'WORKER_CONTINUE_INVALID' })
+    }
+    return subagents.prompt({
+      requestId,
+      parentSessionId,
+      childSessionId,
+      mode: 'continuable',
+      delivery: 'queue',
+      content: [{ type: 'text', text }],
+    }, signalOf())
+  }
+
   const startChildWith = async (bucket, firstInstruction, brief) => {
     const parent = await ensureOwner(bucket)
     const provider = pickProvider()
@@ -469,71 +1024,106 @@ export async function apply(ctx) {
       toolFilter: { deny: ['dsh_collab_send', 'dsh_collab_review'] },
     }
     if (bucket.model !== null) request.agentOptions = { model: bucket.model }
-    const started = await subagents.startContinuable({
+    const spec = {
       provider,
       label: bucket.lane === '@review' ? 'codex-collab-reviewer' : 'codex-collab-worker-' + bucket.lane,
       request,
+      // 预分配 childId：官方要求放在 **startContinuable 顶层 spec.childId**（不是 request.childId）；
+      // 有了它，worker 首个 `kind:user`（无 rpcId）的 claim 才能按精确 id 认领路由。
+      ...(typeof bucket.expectedChildId === 'string' && bucket.expectedChildId !== '' ? { childId: bucket.expectedChildId } : {}),
       signal: signalOf(),
-    })
+    }
+    // 0.2.1 uses activation delivery; 0.2.0 exposes the original continuable entry.
+    // Caller delivery suppresses an unsolicited parent-model turn; lifecycle end remains authoritative.
+    const started = typeof subagents.startActivation === 'function'
+      ? await subagents.startActivation({ ...spec, delivery: 'caller' })
+      : await subagents.startContinuable(spec)
+    if (started.result && typeof started.result.catch === 'function') void started.result.catch(() => {})
     bucket.childId = started.childId
+    // durable child 的 **session id** 在 warm/cold 下都稳定：冷恢复后仍是同一个 id（官方参考脚本实测）
+    bucket.childSessionId = typeof started.sessionId === 'string' && started.sessionId !== '' ? started.sessionId : started.childId
     console.log('[dsh-bridge] worker started for', bucket.key, ':', bucket.childId, 'model:', bucket.model)
     return bucket.childId
   }
 
+  /** 子代理**失败**终态（官方 SubagentResult.stopReason）：这些结束绝不算 done，更不允许 done+空输出。 */
+  const SUBAGENT_FAILURE_STOP_REASONS = new Set(['error', 'aborted', 'refusal', 'max-tokens', 'interrupted', 'failed', 'cancelled'])
   const onChildEnd = (bucket, info) => {
     if (bucket.childId === null || info.id !== bucket.childId) return
     const text = textOfBlocks(info.lastAssistantMessage)
-    const pending = tasks.filter((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
+    const stopReason = info.stopReason
+    const failed = SUBAGENT_FAILURE_STOP_REASONS.has(String(stopReason === undefined || stopReason === null ? '' : stopReason).toLowerCase())
+    const pending = tasks.filter((t) => (t.status === 'accepted' || t.status === 'running' || (t.status === 'unknown' && t.taskId === bucket.executingTaskId)) && t.bucketKey === bucket.key)
     const task = pending.length > 0 ? pending[0] : null
+    if (task !== null) delete task.awaitingOfficialEnd
+    bucket.executingTaskId = null
+    bucket.observationAbort?.abort()
+    if (failed) {
+      // 真实 SDK 终止原因优先：end 只是"子代理结束了"，不等于成功。只按 stopReason 判失败，**不**凭文本空。
+      if (task !== null) {
+        const routeStop = task.routeStopReason
+        task.status = 'error'
+        task.error = 'subagent turn ended as "' + String(stopReason) + '"' + (routeStop === undefined ? '' : ' (routeStopReason=' + routeStop + ')') + (text.length > 0 ? '; partial output not treated as success' : '')
+        task.reason = routeStop === undefined ? REASONS.SUBAGENT_TURN_FAILED : REASONS.MODEL_ROUTE_EXHAUSTED
+        task.stopReason = String(stopReason)
+        if (text.length > 0) task.partialResult = text
+        persistTask(task)
+        pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, stopReason: task.stopReason, childId: bucket.childId, cwd: bucket.cwd, kind: task.kind })
+      } else {
+        broadcast({ type: 'error', taskId: null, childId: bucket.childId, time: Date.now(), error: 'subagent turn ended as "' + String(stopReason) + '"', stopReason: String(stopReason), cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
+      }
+      bucket.activeSince = 0
+      return
+    }
     if (task !== null) {
       task.status = 'done'
+      delete task.error
+      delete task.reason
+      delete task.partialResult
+      delete task.resend
       task.result = text.length > 0 ? text : '(无输出)'
-      task.stopReason = info.stopReason
+      task.stopReason = stopReason
       remember('user', task.instruction)
       remember('assistant', task.result)
       persistTask(task)
-      pushTask(task.taskId, 'result', { text: task.result, stopReason: info.stopReason, childId: bucket.childId, cwd: bucket.cwd, kind: task.kind })
+      pushTask(task.taskId, 'result', { text: task.result, stopReason, childId: bucket.childId, cwd: bucket.cwd, kind: task.kind })
     } else {
-      broadcast({ type: 'result', taskId: null, childId: bucket.childId, time: Date.now(), text, stopReason: info.stopReason, cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
+      broadcast({ type: 'result', taskId: null, childId: bucket.childId, time: Date.now(), text, stopReason, cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
     }
     bucket.activeSince = 0
+    bucket.observationAbort?.abort()
   }
 
-  const deliver = async (bucket, instruction, brief, followupPrefix) => {
+  const deliver = async (bucket, instruction, brief, followupPrefix, requestId) => {
     const parent = await ensureOwner(bucket)
+    bucket.progressTail = ''
+    if (bucket.childId !== null) {
+      const cut = await observations.refresh(bucket.childId, { fresh: true })
+      if (!cut) throw new Error('worker continuation refused: a fresh history boundary could not be observed; nothing was sent')
+      bucket.observedSeq = cut.cursor
+    } else bucket.observedSeq = -1
+    bucket.executingTaskId = requestId
     if (bucket.childId === null) {
       if (bucket.childPromise === null) {
         bucket.childPromise = startChildWith(bucket, instruction, brief).catch((e) => { bucket.childPromise = null; throw e })
         await bucket.childPromise
       } else {
         await bucket.childPromise
-        await subagents.followup(parent, bucket.childId, [{ type: 'text', text: followupPrefix + instruction }], {
-          source: { kind: 'coordinator', form: 'relay', senderSessionId: parent.id },
-          signal: signalOf(),
-        })
+        await promptChild(bucket, parent, requestId, followupPrefix + instruction)
       }
     } else {
-      try {
-        await subagents.followup(parent, bucket.childId, [{ type: 'text', text: followupPrefix + instruction }], {
-          source: { kind: 'coordinator', form: 'relay', senderSessionId: parent.id },
-          signal: signalOf(),
-        })
-      } catch (followupError) {
-        // 兜底：one-shot + 历史摘要（正常情况下宿主插件的真 AbortSignal 已打通 cold-resume）
-        const digest = historyDigest()
-        const text = (digest !== '' ? digest + '\n\n' : '') + brief + instruction
-        const request = { prompt: [{ type: 'text', text }], parent, signal: signalOf() }
-        if (bucket.model !== null) request.agentOptions = { model: bucket.model }
-        const run = await subagents.start('spawn', Object.assign({ label: 'codex-collab-' + bucket.lane + '-' + uid() }, request))
-        const result = await run.result
-        const out = textOfBlocks(result.output)
-        bucket.childId = null
-        bucket.childPromise = null
-        bucket.lastSeen = 0
-        bucket.seenCount = 0
-        void run.dispose()
-        return { fallback: true, output: out.length > 0 ? out : '(无输出)', stopReason: result.stopReason, fallbackNote: 'one-shot (cold-resume unavailable: ' + errText(followupError).slice(0, 200) + ')' }
-      }
+      // warm/cold 继续：同 durable child，官方 `subagents.prompt`（warm 直接复用 live，cold 由官方自然恢复）。
+      // **绝不**在这里 one-shot 新建 child（已接受/未确认都不能重做，不清 childId、不丢 nonce 历史）。
+      await promptChild(bucket, parent, requestId, followupPrefix + instruction)
+    }
+    if (tasks.some(t => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)) {
+      bucket.observationAbort?.abort()
+      bucket.observationAbort = new AbortController()
+      observations.subscribe(bucket.childId, {
+        afterSeq: bucket.observedSeq ?? -1, signal: bucket.observationAbort.signal,
+        address: { kind: 'subagent', parentSessionId: parentSessionIdOf(parent), childSessionId: bucket.childSessionId || bucket.childId, mode: 'continuable' },
+        onEvent: event => observeWorkerEvent(bucket, event),
+      })
     }
     return { fallback: false, output: '', stopReason: '', fallbackNote: '' }
   }
@@ -547,11 +1137,34 @@ export async function apply(ctx) {
   const SESSION_DISPATCH_TIMEOUT_MS = envMs('DSH_BRIDGE_SESSION_DISPATCH_TIMEOUT_MS', 120000)
   /** 见过 running 之后，多久没有新助手文本算读完了。 */
   const SESSION_QUIET_TIMEOUT_MS = envMs('DSH_BRIDGE_SESSION_QUIET_TIMEOUT_MS', 600000)
-  /** 单个会话任务的总预算上限。 */
+  /** 单个会话任务的总预算上限。**未委托**任务按它收口；有认证活跃委托时以 grant 绝对有效期为界。 */
   const SESSION_TOTAL_TIMEOUT_MS = envMs('DSH_BRIDGE_SESSION_TOTAL_TIMEOUT_MS', 3600000)
-  // sessionTargets 以 sessionId 为键：同一会话同时只允许一个在途 bridge 任务。
-  // DSH 自己会排队，但我们无法可靠地把两次并发派的回报各自归属，所以宁可明确拒绝。
+  /** 委托任务的观察宽限（grant 到期后仍允许收尾/交接的余量）。 */
+  const DELEGATED_OBSERVATION_GRACE_MS = envMs('DSH_BRIDGE_DELEGATED_GRACE_MS', 300000)
+  /** 委托观察的硬上限（不超过"授权窗口上限 + 宽限"，保证仍然有界）。 */
+  const MAX_DELEGATED_OBSERVATION_MS = MAX_AUTHORIZED_TTL_MS + DELEGATED_OBSERVATION_GRACE_MS
+  /** steer 回执的观察上限：只等"自己的 rpcId 落进父回合"，单次有界（≤30s），绝不等父任务结果。 */
+  const RECEIPT_OBSERVE_TIMEOUT_MS = envMs('DSH_BRIDGE_RECEIPT_OBSERVE_TIMEOUT_MS', 30000)
+  /** 单次等待之外，回执在**总观察寿命**内继续求证（长工具结束后同父回合的迟到 rpc 仍能被证明）。 */
+  const RECEIPT_TOTAL_OBSERVE_MS = envMs('DSH_BRIDGE_RECEIPT_TOTAL_OBSERVE_MS', 15 * 60 * 1000)
+  /** 回持续证轮询间隔。 */
+  const RECEIPT_POLL_MS = Math.max(50, envMs('DSH_BRIDGE_RECEIPT_POLL_MS', 1000))
+  // 观察记录**按 taskId 保存**（投递控制 D1）：同一会话可以同时有多个来源明确的在途任务
+  // （queue 排进官方 FIFO；steer 回执与父任务同 turn），每条记录只按**自己**的 rpcId→turn/end 结算，
+  // 绝不因为全会话 running/idle 事件就把别的任务标 running/done。
   const sessionTargets = new Map()
+  const taskById = (taskId) => tasks.find((t) => t.taskId === taskId)
+  const recordForTask = (taskId) => sessionTargets.get(taskId)
+  /** 该会话所有未收口的观察记录（顺序 = 入队顺序）。 */
+  const sessionRecords = (sessionId) => Array.from(sessionTargets.values()).filter((r) => r.sessionId === sessionId && r.settled !== true)
+  /** 该会话里**可作为审批 owner** 的队列执行记录（steer 回执永不参与）。 */
+  const queueOwnerRecords = (sessionId) => sessionRecords(sessionId).filter((r) => r.deliver !== 'steer' && r.precise === true)
+  /**
+   * 该记录是否**已真正开始执行**（第四轮 D1）：只有"自己的 rpcId 已被自己的回合认领、且还没收到自己的 turn/end"。
+   * 排队中的任务自己的 rpcId 还没出现在日志里 → 保持 accepted/queued，**不因为会话 running 就标 running**。
+   */
+  const isExecutingRecord = (record) => record !== undefined && record !== null && record.tracker !== undefined
+    && record.tracker.sawRequest === true && record.tracker.end === undefined
 
   const sessionSearch = async (query) => {
     const controller = sessionControllerNow()
@@ -665,15 +1278,73 @@ export async function apply(ctx) {
     return { ok: true, sessionId: picked.sessionId, snippet: picked.snippet, candidates: picked.candidates, matchedBy }
   }
 
-  const sessionPendingTask = (sessionId) => tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.target !== undefined && t.target.kind === 'session' && t.target.sessionId === sessionId)
+  /**
+   * **非终态状态集合**（第二轮修正 blocker 2）：`needs-approval` 也是"在途"——它表示任务还挂在
+   * 同一个会话的同一个 R1 request/turn 上，只差一次审批。漏掉它会让第二个任务被接受并覆盖
+   * sessionTargets 原 record（root 复现：busySecondDispatchStatus=202）。
+   */
+  const NON_TERMINAL_STATUSES = new Set(['accepted', 'queued', 'running', 'needs-approval'])
+  const isNonTerminal = (task) => task !== undefined && task !== null && (NON_TERMINAL_STATUSES.has(task.status) || task.awaitingOfficialEnd === true)
+
+  /** 同会话已有在途任务（含等待审批）→ 新派活必须被拒（零 prompt），保住原 record/观察/结果。 */
+  const sessionPendingTask = (sessionId) => tasks.find((t) => isNonTerminal(t) && t.target !== undefined && t.target.kind === 'session' && t.target.sessionId === sessionId)
+
+  /**
+   * 观测官方 `approval/asked|decided`（修正 F）：
+   *   - asked → 建立 officialId ↔ (session, toolName, callId) 台账，供 answerer **唯一认领**（不再"只记最后一个"）；
+   *   - decided → 按**具体 officialId** 收敛，且状态由官方 outcome 决定
+   *     （allowed-once→confirmed；cancelled/rejected 绝不算批准；未知→decision-unknown）。
+   * 只做观测与状态推进，**永不写会话日志**（asked/decided 只有官方服务能写），
+   * 也不在 handler 里等自己的 decided（官方是 handler 返回后才 append）。
+   */
+  const observeApprovalEvents = (sessionId, events) => {
+    if (approvalStore === null || !Array.isArray(events)) return
+    for (const ev of events) {
+      if (ev === null || typeof ev !== 'object') continue
+      const data = ev.data !== undefined && ev.data !== null && typeof ev.data === 'object' ? ev.data : {}
+      if (ev.type === 'approval/asked' && typeof data.id === 'string') {
+        approvalStore.observeOfficialAsked({
+          officialId: data.id,
+          sessionId,
+          toolName: typeof data.toolName === 'string' ? data.toolName : '',
+          callId: typeof data.callId === 'string' ? data.callId : undefined,
+        })
+        continue
+      }
+      if (ev.type !== 'approval/decided' || typeof data.id !== 'string') continue
+      const settled = approvalStore.settleFromOfficial(data.id, typeof data.outcome === 'string' ? data.outcome : 'unknown')
+      if (settled.ok !== true) continue
+      const pending = approvalStore.listPending({}).find((p) => p.officialId === data.id)
+      const ownerTask = pending === undefined ? undefined : tasks.find((t) => t.taskId === pending.taskId)
+      if (ownerTask !== undefined) {
+        pushTask(ownerTask.taskId, 'approval-official', {
+          officialId: data.id,
+          outcome: typeof data.outcome === 'string' ? data.outcome : undefined,
+          state: settled.state,
+          target: { kind: 'session', sessionId },
+        })
+      }
+    }
+  }
 
   const settleSessionTask = (record, status, fields) => {
     if (record.settled) return
     record.settled = true
     if (record.abort !== undefined) { try { record.abort.abort() } catch (e) { /* ignore */ } }
-    sessionTargets.delete(record.sessionId)
+    sessionTargets.delete(record.taskId)
     const task = tasks.find((t) => t.taskId === record.taskId)
     if (task === undefined) return
+    // 任务收口只处置**自己这条 task** 的审批挂起项（第四轮 D1：绝不按 session 清掉别的任务/回执的 pending）：    //   - 还在 pending → superseded（交给正式人工/下游链）；
+    //   - 已提交但没等到官方 approval/decided 确认 → decision-unknown（不重发放行）。
+    if (approvalStore !== null) {
+      for (const p of approvalStore.listPending({ sessionId: record.sessionId, taskId: record.taskId })) {
+        if (p.state === APPROVAL_STATES.PENDING) {
+          approvalStore.closePending(p.approvalKey, APPROVAL_STATES.SUPERSEDED, 'task settled while this approval was still pending')
+        } else if (p.state === APPROVAL_STATES.SUBMITTED) {
+          approvalStore.markDecisionUnknown(p.approvalKey, 'task settled before an official approval/decided confirmation was observed')
+        }
+      }
+    }
     task.status = status
     if (fields.result !== undefined) task.result = fields.result
     if (fields.error !== undefined) task.error = fields.error
@@ -684,6 +1355,7 @@ export async function apply(ctx) {
     if (fields.turnEndKind !== undefined) task.turnEndKind = fields.turnEndKind
     if (fields.note !== undefined) task.note = fields.note
     if (fields.resend !== undefined) task.resend = fields.resend
+    if (fields.routeStopReason !== undefined) task.routeStopReason = fields.routeStopReason
     // 精确关联模式：回显这次请求的 requestId 与匹配到的 DSH turn（便于跨回合核对归属）。
     if (record.precise === true) {
       task.requestId = record.taskId
@@ -700,18 +1372,51 @@ export async function apply(ctx) {
   }
 
   /**
+   * 路由已按"本任务"给出终态（候选耗尽 / 禁 fallback 终止）：这是**可信的本任务终止事实**。
+   * 优先让原生 `turn/end` 证据收口（follow 是实时的）；有界兜底再用该事实收口，避免 HTTP 悬挂 accepted。
+   * 只处置**本任务**（不 cancel 用户 Agent、不清别人的 inbox、不碰其他 queue、不重派）。
+   */
+  const scheduleRouteFinalize = (task, reason) => {
+    if (task === undefined || task === null || task.routeFinalizeScheduled === true) return
+    task.routeFinalizeScheduled = true
+    const terminalReason = task.routeStopReason === undefined ? reason : task.routeStopReason
+    const settleByFact = () => {
+      if (task.status === 'done' || task.status === 'error' || task.status === 'cancelled') return
+      const record = sessionTargets.get(task.taskId)
+      if (record === undefined || record.settled === true) return   // worker 路径由 subagent/end 收口
+      settleSessionTask(record, 'error', {
+        error: 'model routing stopped this task before a successful turn (routeStopReason=' + String(terminalReason) + ')',
+        reason: REASONS.MODEL_ROUTE_EXHAUSTED,
+        routeStopReason: terminalReason,
+        note: 'route-terminal-fact',
+      })
+    }
+    // 1) 先给原生证据一次机会：读一次会话日志；能拿到本请求的 turn/end 就按原生原因收口（更准确）。
+    void (async () => {
+      const record = sessionTargets.get(task.taskId)
+      if (record !== undefined && record.settled !== true && record.precise === true) {
+        await observeSessionLog(record)
+        if (record.settled !== true && record.tracker !== undefined && record.tracker.end !== undefined) { settleFromTracker(record); return }
+      }
+      // 2) 原生证据还没到达（follow/poll 有延迟）→ 用**可信的本任务终止事实**有界收口，绝不悬挂 accepted。
+      const waitMs = 250
+      const go = () => { try { setTimeout(settleByFact, waitMs) } catch (e) { settleByFact() } }
+      if (timer !== undefined && timer !== null && typeof timer.timeout === 'function') {
+        try { void Promise.resolve(timer.timeout(waitMs)).then(() => { if (task.status === 'accepted' || task.status === 'running') settleByFact() }, settleByFact) } catch (e) { go() }
+      } else go()
+    })()
+  }
+
+  /**
    * 把"读日志"当成一次**观察机会**（不是完成证明）：把日志事件喂给关联器。
    * 与 live follow 共用同一套规则，靠 seq 去重。
    */
   const observeSessionLog = async (record) => {
-    if (sessionQuery === undefined) return
-    try {
-      const snap = await sessionQuery.readSession(record.sessionId)
-      const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
-      for (const event of events) consumeSessionEvent(record.tracker, event)
-    } catch (e) {
-      console.error('[dsh-bridge] session observation failed:', errText(e).slice(0, 200))
-    }
+    const snap = await observations.since(record.sessionId, record.observedSeq ?? -1)
+    if (!snap || record.settled) return
+    observeApprovalEvents(record.sessionId, snap.events)
+    for (const event of snap.events) consumeSessionEvent(record.tracker, event)
+    record.observedSeq = snap.cursor
   }
 
   /** 精确模式下的进度推送：只推自己那个 turn 的**新增**文本。 */
@@ -733,13 +1438,20 @@ export async function apply(ctx) {
   const settleFromTracker = (record) => {
     const outcome = turnOutcome(record.tracker.end)
     const text = record.tracker.text.trim()
+    const task = tasks.find((t) => t.taskId === record.taskId)
+    const routeStop = task === undefined ? undefined : task.routeStopReason
     if (outcome.ok) {
       settleSessionTask(record, 'done', { result: text === '' ? '(无输出)' : text, stopReason: 'request-turn-completed' })
       return
     }
+    // 路由已给出本任务终态（耗尽/禁 fallback）→ 用稳定 reason 收口，并保留 routeStopReason；
+    // 其余非 completed 结束仍按 TURN_FAILED 如实失败。
     settleSessionTask(record, 'error', {
-      error: 'the DSH turn for this request ended as "' + outcome.kind + '" (only "completed" is success)',
-      reason: REASONS.TURN_FAILED,
+      error: routeStop === undefined
+        ? 'the DSH turn for this request ended as "' + outcome.kind + '" (only "completed" is success)'
+        : 'model routing stopped this task (routeStopReason=' + routeStop + '); the DSH turn ended as "' + outcome.kind + '"',
+      reason: routeStop === undefined ? REASONS.TURN_FAILED : REASONS.MODEL_ROUTE_EXHAUSTED,
+      ...(routeStop === undefined ? {} : { routeStopReason: routeStop }),
       turnEndKind: outcome.kind,
       ...(text === '' ? {} : { partialResult: text }),
     })
@@ -762,8 +1474,9 @@ export async function apply(ctx) {
       let extractedText = ''
       if (sessionQuery !== undefined) {
         try {
-          const snap = await sessionQuery.readSession(record.sessionId)
+          const snap = await observations.capture(record.sessionId)
           const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
+          observeApprovalEvents(record.sessionId, events)
           const extracted = extractNewAssistantText(events, record.baseline)
           record.baseline = extracted.baseline
           extractedText = extracted.text
@@ -777,47 +1490,204 @@ export async function apply(ctx) {
   }
 
   const watchSessionTask = (record) => {
-    // 主路径：follow 增量流（不激活 Agent，也不重读整份日志——目标会话可能有几十 MB）。
-    const controller = new AbortController()
-    record.abort = controller
+    record.abort ??= new AbortController()
     record.watcher = 'follow'
-    void (async () => {
-      try {
-        const controllerRef = sessionControllerNow()
-        if (controllerRef === undefined) throw new Error('sessionController is not mounted')
-        const stream = controllerRef.follow({ address: { kind: 'session', sessionId: record.sessionId } }, controller.signal)
-        for await (const frame of stream) {
-          if (record.settled) break
-          if (frame === null || typeof frame !== 'object') continue
-          // 精确关联模式：live 帧、开场 snapshot.records 与读日志共用同一套关联规则。
-          if (record.precise === true) {
-            const outcome = frame.type === 'snapshot'
-              ? consumeSnapshotFrame(record.tracker, frame)
-              : (frame.type === 'event' ? consumeSessionEvent(record.tracker, frame.event) : 'ignored')
-            if (outcome === 'progress') pushPreciseProgress(record)
-            if (outcome === 'settled') { settleFromTracker(record); break }
-            continue
-          }
-          if (frame.type !== 'event') continue // 旧路径：snapshot 是派发前的历史，不作为本轮输出
-          const text = assistantTextOf(frame.event)
-          if (text === '') continue
-          record.total += text
-          record.activeSince = Date.now()
-          const task = tasks.find((t) => t.taskId === record.taskId)
-          if (task !== undefined && task.status === 'accepted') task.status = 'running'
-          pushTask(record.taskId, 'progress', { text, target: { kind: 'session', sessionId: record.sessionId } })
-        }
-      } catch (e) {
+    observations.subscribe(record.sessionId, {
+      afterSeq: record.observedSeq ?? -1,
+      signal: record.abort.signal,
+      onUncertain: () => { if (!record.settled) record.watcher = 'poll' },
+      onEvent: (event) => {
         if (record.settled) return
-        // 降级：交给 2.5s 轮询（与子代理路径同一套解析），并在任务上标出来以便观测。
-        record.watcher = 'poll'
-        console.error('[dsh-bridge] follow unavailable, falling back to polling:', errText(e).slice(0, 200))
+        record.observedSeq = event.seq
+        observeApprovalEvents(record.sessionId, [event])
+        if (record.precise) {
+          const outcome = consumeSessionEvent(record.tracker, event)
+          const task = taskById(record.taskId)
+          if (task && (task.status === 'accepted' || task.status === 'queued') && isExecutingRecord(record)) {
+            task.status = 'running'
+            pushTask(record.taskId, 'running', { target: { kind: 'session', sessionId: record.sessionId }, deliver: record.deliver })
+          }
+          if (outcome === 'progress') pushPreciseProgress(record)
+          if (outcome === 'settled') settleFromTracker(record)
+        } else {
+          const text = assistantTextOf(event)
+          if (text) { record.total += text; record.activeSince = Date.now(); pushTask(record.taskId, 'progress', { text, target: { kind: 'session', sessionId: record.sessionId } }) }
+        }
+      },
+    })
+  }
+
+  /**
+   * 回执的**自身输入证据**（第四轮 C）：只用"自己的 rpcId 的 user/message 落在哪个回合"这一条证据。
+   * 绝不复用通用 tracker（那会累计父任务的助手文本、被普通 sweep 当成执行收口）。
+   * 返回 `{state, evidence}`：state ∈ observed | deviated | pending | unconfirmed。
+   */
+  const receiptEvidenceOf = async (record, task) => {
+    const events = await readSessionEvents(record.sessionId)
+    // 读取失败（瞬时故障/会话不可读）：**结论未知**——绝不据此写任何状态（第二次验收修正 2）。
+    if (events === null) return { state: 'read-error', evidence: null, events: null }
+    if (record.settled === true) return { state: 'settled', evidence: null, events }
+    record.sawSuccessfulRead = true      // 只有真的读到过日志，才允许下"未确认"的结论
+    const evidence = findRequestEvidence(events, task.taskId)
+    const targetTurn = Number.isInteger(record.parentTurn) ? record.parentTurn : (Number.isInteger(task.parentTurn) ? task.parentTurn : undefined)
+    if (evidence === null || evidence.turn === null) {
+      // 我方 rpcId 还没出现：父回合已结束 → 再也等不到（明确未确认）；父回合仍开放 → 继续等（长工具后的迟到 rpc 仍可被后续查询证明）。
+      if (targetTurn !== undefined && turnHasEnded(events, targetTurn)) return { state: 'unconfirmed', evidence: null, events }
+      return { state: 'pending', evidence: null, events }
+    }
+    if (targetTurn === undefined || evidence.turn === targetTurn) return { state: 'observed', evidence, events }
+    // 官方把这条补充落进了**另一个回合**（异步 admission / wakingAfterAbort 改道）：如实报告偏离，绝不假成功。
+    return { state: 'deviated', evidence, events }
+  }
+
+  /** 回执观察的**唯一**终态收口（第二次验收修正 2/3）：幂等 + 单调 + 卸载门闩。 */
+  const settleReceiptRecord = (record) => {
+    if (record.settled === true && typeof record.receiptWake !== 'function') return
+    record.settled = true
+    // 释放自己的等待定时器：让循环立刻醒来退出，而不是继续睡到下一个 tick（"及时释放"）。
+    if (typeof record.receiptWake === 'function') {
+      const wake = record.receiptWake
+      record.receiptWake = undefined
+      try { wake() } catch (e) { /* ignore */ }
+    }
+  }
+
+  /** 可被 settle 立刻唤醒的等待（卸载后不再空转）。 */
+  const sleepWithWake = (record, ms) => new Promise((resolve) => {
+    const timer = setTimeout(() => { record.receiptWake = undefined; resolve() }, ms)
+    record.receiptWake = () => { clearTimeout(timer); resolve() }
+  })
+
+  /**
+   * 幂等终态收口：首循环 / 后台续证 / 显式查询续证**共用这一条路径**。
+   *  · `record.settled`（卸载/已收口）→ 不读不写；
+   *  · 已证终态 `observed`/`deviated` **单调不可回退**（临时读失败/陈旧读取绝不能改回 pending/unconfirmed）；
+   *  · `unconfirmed` 只可能由"成功读取证明父回合已结束"或"观察寿命到期"产生，且可被之后的成功读取升级回 observed；
+   *  · pending 不重复写。
+   */
+  const finalizeReceipt = (record, task, outcome, options = {}) => {
+    if (record === undefined || record.settled === true) return false
+    const current = task.receiptState
+    if (current === 'observed' || current === 'deviated') return false          // 已证事实绝不回退
+    if (current === 'unconfirmed' && outcome.state !== 'observed') return false  // 只允许"恢复读取后升级"
+    if (outcome.state === 'pending' && current === 'pending') return false
+    applyReceiptEvidence(record, task, outcome)
+    if (outcome.state !== 'pending' && options.keepForQuery !== true) settleReceiptRecord(record)
+    return true
+  }
+  /** 把回执证据写进任务与落盘记录（父结果永不残留）。 */
+  const applyReceiptEvidence = (record, task, outcome) => {
+    const push = {
+      ...(outcome.note === undefined ? {} : { note: outcome.note }),
+      ...(outcome.text === undefined ? {} : { text: outcome.text }),
+    }
+    task.resultScope = 'parent-task'
+    task.result = undefined                      // 回执不承载父结果；配合 persistTask 的显式清除
+    task.resend = false
+    if (outcome.observedTurn !== undefined) task.observedTurn = outcome.observedTurn
+    if (outcome.requestSeq !== undefined) task.requestSeq = outcome.requestSeq
+    task.receiptState = outcome.state
+    task.status = outcome.status
+    if (outcome.reason !== undefined) task.reason = outcome.reason
+    persistTask(task)
+    pushTask(task.taskId, outcome.status, {
+      parentTaskId: record.parentTaskId, requestId: task.taskId, resultScope: 'parent-task',
+      ...(task.observedTurn === undefined ? {} : { observedTurn: task.observedTurn }),
+      ...(Number.isInteger(record.parentTurn) ? { parentTurn: record.parentTurn } : {}),
+      ...push,
+      target: { kind: 'session', sessionId: record.sessionId },
+    })
+  }
+
+  /**
+   * steer 回执观察（第四轮 D1 + 首次验收修正 B/C）：
+   *  1. 单次有界等待（默认 ≤30s，`RECEIPT_OBSERVE_TIMEOUT_MS`）→ 观察到就 observed；
+   *  2. 界内没等到**不是**永久未确认：转 `receipt-pending` 并在**总观察寿命**（`RECEIPT_TOTAL_OBSERVE_MS`）内后台继续求证，
+   *     同时每次显式查询都会再核一次（长工具结束后同父回合的迟到 rpc 仍能被后续查询证明）；
+   *  3. 只认"自己的 rpcId 落在服务端捕获的父回合"：落到别的回合 → `receipt-deviated`（真实 observedTurn），
+   *     父回合已结束而自己没落进去 → `receipt-unconfirmed`；两者都 `resend:false`。
+   *  绝不累计父任务助手文本、绝不等父任务结果、绝不参与审批归属。
+   */
+  const observeSteerReceipt = async (record, task) => {
+    const deadline = Date.now() + RECEIPT_OBSERVE_TIMEOUT_MS
+    /** 单次检查 → 收口；返回 true 表示"已有结论（或已卸载）"。瞬时读失败**不写任何状态**。 */
+    const step = (check) => {
+      if (check.state === 'read-error' || check.state === 'settled') return record.settled === true
+      if (check.state === 'observed') {
+        finalizeReceipt(record, task, { state: 'observed', status: 'receipt-observed', observedTurn: check.evidence.turn, requestSeq: check.evidence.seq, note: 'receipt-observed' })
+        return true
       }
-    })()
+      if (check.state === 'deviated') {
+        finalizeReceipt(record, task, { state: 'deviated', status: 'receipt-deviated', reason: REASONS.RECEIPT_TURN_DEVIATED, observedTurn: check.evidence.turn, requestSeq: check.evidence.seq, note: 'RECEIPT-TURN-DEVIATED' })
+        return true
+      }
+      if (check.state === 'unconfirmed') {
+        finalizeReceipt(record, task, { state: 'unconfirmed', status: 'receipt-unconfirmed', reason: REASONS.RECEIPT_UNCONFIRMED, note: 'RECEIPT-UNCONFIRMED' })
+        return true
+      }
+      return false
+    }
+    for (;;) {
+      if (record.settled === true) return
+      if (step(await receiptEvidenceOf(record, task)) === true) return
+      if (record.settled === true) return                 // await 之后：卸载门闩（绝不写盘）
+      if (Date.now() >= deadline) break
+      await sleepWithWake(record, 250)
+    }
+    if (record.settled === true) return
+    // 界内未观察到：转 pending（**不是**终态），后台在总观察寿命内继续求证。
+    finalizeReceipt(record, task, {
+      state: 'pending', status: 'receipt-pending', note: 'RECEIPT-PENDING',
+      text: '官方已接收这条补充；有界等待窗口内还没观察到自己的 rpcId 落进父回合。**不要重发**：本回执仍在观察寿命内继续求证，也可随时显式查询（父任务结果请查父 task）。',
+    })
+    if (record.settled === true) return
+    const totalDeadline = Date.now() + RECEIPT_TOTAL_OBSERVE_MS
+    record.watcher = 'receipt'
+    for (;;) {
+      await sleepWithWake(record, RECEIPT_POLL_MS)
+      if (record.settled === true) return                 // 卸载/已收口 → 零读取、零写盘
+      if (step(await receiptEvidenceOf(record, task)) === true) return
+      if (record.settled === true) return
+      if (Date.now() >= totalDeadline) {
+        // 观察寿命到期：**只有"成功读取已证明父回合结束"**才允许 unconfirmed（那条路径在上面的 step 里就已收口）。
+        // 到期而证据不足时**绝不臆造未确认**（第二次验收修正 2）：保留 pending 记录，等后续显式查询继续求证。
+        record.watcher = record.sawSuccessfulRead === true ? 'receipt-expired' : 'receipt-expired-unread'
+        pushTask(task.taskId, 'note', {
+          parentTaskId: record.parentTaskId, requestId: task.taskId, resultScope: 'parent-task',
+          note: 'RECEIPT-UNRESOLVED',
+          text: '官方已接收这条补充；到观察寿命结束仍未取得"自身 rpcId 落进父回合"或"父回合已结束"的证据——**不下结论、不重发**；读取恢复后显式查询即可继续求证。',
+          target: { kind: 'session', sessionId: record.sessionId },
+        })
+        return
+      }
+    }
+  }
+
+  /**
+   * 显式查询回执时的**同步续证**（第四轮 C）：状态查询本身就是一次官方证据机会，
+   * 因此"长工具结束后同父回合的迟到 rpc"不会因为单次等待窗口过去而永久丢确认。
+   * 走**同一条**幂等收口：已证 observed/deviated 不回退；临时读失败什么都不写（第二次验收修正 2）。
+   */
+  const refreshReceiptNow = async (record, task) => {
+    if (record.settled === true) return
+    if (task.receiptState !== 'pending' && task.receiptState !== 'accepted' && task.receiptState !== 'unconfirmed') return
+    const check = await receiptEvidenceOf(record, task)
+    if (record.settled === true) return
+    if (check.state === 'observed') {
+      finalizeReceipt(record, task, { state: 'observed', status: 'receipt-observed', observedTurn: check.evidence.turn, requestSeq: check.evidence.seq, note: 'receipt-observed' })
+      return
+    }
+    if (check.state === 'deviated') {
+      finalizeReceipt(record, task, { state: 'deviated', status: 'receipt-deviated', reason: REASONS.RECEIPT_TURN_DEVIATED, observedTurn: check.evidence.turn, requestSeq: check.evidence.seq, note: 'RECEIPT-TURN-DEVIATED' })
+      return
+    }
+    if (check.state === 'unconfirmed') {
+      finalizeReceipt(record, task, { state: 'unconfirmed', status: 'receipt-unconfirmed', reason: REASONS.RECEIPT_UNCONFIRMED, note: 'RECEIPT-UNCONFIRMED' }, { keepForQuery: true })
+    }
   }
 
   /** 派发一条指令进已有会话。任何失败都不创建会话，只落一个 error 任务。 */
-  const dispatchToSession = async (instruction, target, deliver, notes, incomingHistory, originThreadId) => {
+  const dispatchToSession = async (instruction, target, deliver, notes, incomingHistory, originThreadId, delegateOptions, steering, routePolicy) => {
     const task = {
       taskId: uid(), kind: 'task', instruction,
       target: { kind: 'session', sessionId: target.sessionId, query: target.query, snippet: target.snippet },
@@ -825,17 +1695,33 @@ export async function apply(ctx) {
       cwd: undefined, lane: undefined, bucketKey: undefined,
     }
     rememberTask(tasks, task)
+    // 任务作用域的 abort（模型路由预算耗尽时**只终止本任务**；不碰用户回合、不碰别的任务）
+    const taskAbort = new AbortController()
 
-    // 带来源的"精确关联模式"要求一个请求对应一个可判定的 turn；steer 会把整批 next-step 合并进
-    // 同一个 turn（多个 request 共用），无法为本次请求单独保证结果归属。执行前明确拒绝（零 prompt）。
-    if (originThreadId !== undefined && deliver === 'steer') {
+    // ---- 投递控制（第四轮）：queue = 排进官方 FIFO 的**独立**任务；steer = 明确父任务的补充回执 ----
+    const mode = deliver === 'steer' ? 'steer' : 'queue'
+    const parentTaskId = steering !== undefined && steering !== null && typeof steering.parentTaskId === 'string' && steering.parentTaskId !== ''
+      ? steering.parentTaskId
+      : undefined
+    const expectedTurn = steering !== undefined && steering !== null && Number.isInteger(steering.expectedTurn) ? steering.expectedTurn : undefined
+    const refuseDispatch = (reason, message) => {
       const bound = bindAssociation(task, originThreadId)
       task.status = 'error'
-      task.error = 'origin-bound session dispatch refuses deliver=steer: several requests can share one turn, so this request\'s result could not be attributed precisely. Use deliver=queue (or drop originThreadId for the legacy unbound behavior).'
-      task.reason = REASONS.ORIGIN_STEER_UNSUPPORTED
+      task.error = message
+      task.reason = reason
       if (bound.ok) persistTask(task)
-      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason })
-      return { task, failed: { reason: task.reason, message: task.error, candidates: [] } }
+      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, ...(originThreadId === undefined ? {} : { originThreadId }) })
+      return { task, failed: { reason, message, candidates: [] } }
+    }
+    if (mode === 'steer') {
+      // 无来源 steer 会改动"可能是别人的"在途任务 → 零投递
+      if (originThreadId === undefined) {
+        return refuseDispatch(REASONS.ORIGIN_REQUIRED_FOR_STEER, 'unbound steer is refused: it would change a task that may belong to another source. Pass originThreadId and parentTaskId.')
+      }
+      // 显式父任务是硬要求（绝不按"最近/最老任务"推断）
+      if (parentTaskId === undefined) {
+        return refuseDispatch(REASONS.PARENT_REQUIRED, 'steer requires an explicit parentTaskId — the parent is never inferred from "most recent"/"oldest" task')
+      }
     }
 
     const resolved = await resolveSessionTarget(target)
@@ -852,13 +1738,112 @@ export async function apply(ctx) {
     if (resolved.candidates.length > 0) task.candidates = resolved.candidates
     if (resolved.matchedBy !== undefined) task.matchedBy = resolved.matchedBy
 
-    const inFlight = sessionPendingTask(resolved.sessionId)
-    if (inFlight !== undefined && inFlight.taskId !== task.taskId) {
-      task.status = 'error'
-      task.error = 'another bridge task is already pending on this session'
-      task.reason = REASONS.BUSY
-      pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, target: { kind: 'session', sessionId: resolved.sessionId } })
-      return { task, failed: { reason: REASONS.BUSY, message: task.error, candidates: [] } }
+    // ---- 忙时不等于错误（第四轮 D1）：
+    //   * 来源绑定的 queue：**允许**在同一会话已有在途任务时接收（排进官方 FIFO，各自独立 requestId/回合/结果）；
+    //   * steer：校验父任务（同一来源/会话/profile + 真正在执行 + 回合可证）后作为回执接收；
+    //   * 旧无来源（不可精确关联）路径：保持原忙锁；且与新的来源绑定任务**不得混用**（结果归属会被污染）。
+    const activeRecords = sessionRecords(resolved.sessionId)
+    const legacyActive = activeRecords.some((r) => r.precise !== true)
+    if (originThreadId === undefined) {
+      const inFlight = sessionPendingTask(resolved.sessionId)
+      if (inFlight !== undefined && inFlight.taskId !== task.taskId) {
+        return refuseDispatch(REASONS.BUSY, 'another bridge task is already pending on this session')
+      }
+    } else if (legacyActive) {
+      return refuseDispatch(REASONS.LEGACY_MIX_UNSAFE, 'this session already has an unbound (non-precise) bridge task; a source-bound task cannot be attributed safely alongside it — wait for it to finish or use another session')
+    }
+    if (mode === 'steer') {
+      const parent = taskById(parentTaskId)
+      if (parent === undefined || parent.target === undefined || parent.target.kind !== 'session') {
+        return refuseDispatch(REASONS.PARENT_INVALID, 'unknown parent task ' + parentTaskId)
+      }
+      if (parent.target.sessionId !== resolved.sessionId) {
+        return refuseDispatch(REASONS.PARENT_INVALID, 'parent task ' + parentTaskId + ' belongs to another session')
+      }
+      if (parent.originThreadId !== originThreadId) {
+        return refuseDispatch(REASONS.PARENT_INVALID, 'parent task ' + parentTaskId + ' belongs to another source conversation')
+      }
+      if (parent.deliver === 'steer') {
+        return refuseDispatch(REASONS.PARENT_INVALID, 'a steer receipt cannot itself be a parent')
+      }
+      if (parent.status === 'done' || parent.status === 'error' || parent.status === 'cancelled' || parent.status === 'unknown') {
+        return refuseDispatch(REASONS.PARENT_TERMINAL, 'parent task ' + parentTaskId + ' is already terminal (' + parent.status + '); nothing left to steer — queue a new task instead')
+      }
+      if (parent.status !== 'running' && parent.status !== 'needs-approval') {
+        return refuseDispatch(REASONS.PARENT_QUEUED, 'parent task ' + parentTaskId + ' is ' + parent.status + ' (not executing yet); steering a queued parent is meaningless — wait until it runs')
+      }
+      // 首次验收修正 B：拒绝只看**缓存** parent.status/tracker——官方日志可能早已"父回合 end + 新回合 start"。
+      // 因此这里 fresh 读一次官方日志，用"父回合是否仍是当前开放回合"这一硬证据做预检。
+      const parentRecord = recordForTask(parent.taskId)
+      const parentTurn = parentRecord !== undefined && parentRecord.tracker !== undefined && Number.isInteger(parentRecord.tracker.turn) ? parentRecord.tracker.turn : undefined
+      if (parentTurn === undefined) {
+        return refuseDispatch(REASONS.PARENT_INVALID, 'parent task ' + parentTaskId + ' has no provably open turn (no rpcId/turn evidence)')
+      }
+      if (parentRecord.tracker.end !== undefined) {
+        return refuseDispatch(REASONS.PARENT_TERMINAL, 'parent task ' + parentTaskId + ' has already ended its turn (tracker收口证据); nothing left to steer')
+      }
+      const parentEvents = await readSessionEvents(resolved.sessionId)
+      if (parentEvents !== null) {
+        if (turnHasEnded(parentEvents, parentTurn)) {
+          return refuseDispatch(REASONS.PARENT_TURN_CLOSED, 'parent task ' + parentTaskId + ' 的回合 ' + parentTurn + ' 在官方日志里已经 turn/end；插入没有意义（执行前拒绝、零 prompt）')
+        }
+        const openTurn = currentOpenTurn(parentEvents)
+        if (openTurn !== null && openTurn !== parentTurn) {
+          return refuseDispatch(REASONS.PARENT_TURN_CLOSED, 'parent task ' + parentTaskId + ' 的回合 ' + parentTurn + ' 已不是当前开放回合（官方日志当前开放 turn=' + openTurn + '）；执行前拒绝、零 prompt')
+        }
+      }
+      if (expectedTurn !== undefined && expectedTurn !== parentTurn) {
+        return refuseDispatch(REASONS.PARENT_TURN_MISMATCH, 'expectedTurn=' + expectedTurn + ' does not match the parent task\'s current turn ' + parentTurn)
+      }
+      task.parentTaskId = parentTaskId
+      task.requestedMode = 'steer'
+      task.resultScope = 'parent-task'
+      task.receiptState = 'accepted'
+      task.observedTurn = undefined
+      task.expectedTurn = expectedTurn
+      // 服务端**自己捕获**的目标父回合：expectedTurn 可有可无都不会丢目标（B）。
+      task.parentTurn = parentTurn
+    } else {
+      task.requestedMode = 'queue'
+      // 队列语义：同一会话已有在途任务时，新任务先落 'queued'（还没轮到它），自己的 rpcId 出现后才变 running。
+      if (activeRecords.some((r) => isExecutingRecord(r))) task.status = 'queued'
+    }
+
+    // 模型路由（M2）：**派活前**登记任务策略（steer 回执沿父，不另建策略）。
+    if (routePolicy !== undefined && mode !== 'steer') {
+      task.routePolicy = routePolicy
+      const plan = await modelRouting.planRoute({
+        taskId: task.taskId,
+        policy: routePolicy,
+        kind: task.kind,
+        execution: 'session',
+        originThreadId,
+        sessionId: resolved.sessionId,
+        // 预算耗尽/托管终态：**不 abort 自己的观察者**（那会丢掉原生 turn/end 证据 → HTTP 悬挂 accepted）。
+        // 记录本任务的稳定终止事实，由观察者按原生 turn/end 收口；有界兜底再用该事实收口。
+        onTerminal: (info) => {
+          const reason = info !== null && typeof info === 'object' && typeof info.reason === 'string' ? info.reason : 'terminal'
+          task.routeStopReason = reason
+          if (info !== null && typeof info === 'object' && info.exhausted === true) scheduleRouteFinalize(task, reason)
+        },
+        onExhausted: (reason) => {
+          task.routeStopReason = reason
+          scheduleRouteFinalize(task, reason)
+        },
+      })
+      const chosen = plan.selection !== null && plan.selection.ok === true ? { provider: plan.selection.pair.provider, model: plan.selection.pair.model } : null
+      const reason = plan.selection === null ? 'inherit' : plan.selection.reason
+      task.route = {
+        mode: routePolicy.mode,
+        allowFallback: routePolicy.allowFallback,
+        chosen,
+        reason,
+        ...(plan.selection !== null && plan.selection.ok !== true && Array.isArray(plan.selection.candidates) ? { candidates: plan.selection.candidates.slice(0, 5) } : {}),
+      }
+      // 精确指定但目录里没有 / 同名跨 provider 歧义 → **派活前拒绝**（绝不静默跑另一个模型）
+      if (routePolicy.mode === 'exact' && chosen === null) {
+        return refuseDispatch(REASONS.MODEL_ROUTE_INVALID, 'exact model request cannot be satisfied from the registered catalog: ' + reason + (task.route.candidates === undefined ? '' : ' (candidates: ' + task.route.candidates.map((c) => c.provider + '/' + c.model).join(', ') + ')'))
+      }
     }
 
     // 来源关联必须在**实际投递之前**落盘：绑定失败就不投递（宁可失败，也不出现"执行了却没绑定"）。
@@ -870,34 +1855,84 @@ export async function apply(ctx) {
       pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, target: { kind: 'session', sessionId: resolved.sessionId } })
       return { task, failed: { reason: bound.reason, message: bound.message, candidates: [] } }
     }
+    // 模型路由选择：**绑定之后**才持久化（bind 时已带 route/routePolicy；这里只刷新非秘密回显字段，
+    // 不再出现 "association update failed: task has no association record" 这种真实日志错误）。
+    if (routePolicy !== undefined && mode !== 'steer') persistTask(task)
 
-    // 派发前取基线：结果只回报这一轮新产生的助手文本。
-    let baseline = { count: 0, textLen: 0 }
-    if (sessionQuery !== undefined) {
+    // 审批委托时序（方案 §4.1 / 验收要求）：**grant 与 origin 绑定必须在发出 prompt/运行工具之前完成**，
+    // 失败则零派活（这里直接返回 error，不进入 prompt/queue）。
+    if (delegateOptions !== undefined && delegateOptions !== null) {
+      const failDelegate = (reason, message) => {
+        task.status = 'error'
+        task.reason = reason
+        task.error = message
+        persistTask(task)
+        pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, target: { kind: 'session', sessionId: resolved.sessionId } })
+        return { task, failed: { reason, message, candidates: [] } }
+      }
+      if (approvalStore === null) {
+        return failDelegate('approval-store-unavailable', 'delegated dispatch refused: the approval store could not be opened (nothing was sent)')
+      }
+      const credDigest = approvalCredDigest()
+      if (credDigest === null) {
+        return failDelegate(APPROVAL_REASONS.NO_KEY, 'delegated dispatch refused: no valid control key on this gateway — initialize it offline first (nothing was sent)')
+      }
+      if (task.originThreadId === undefined) {
+        return failDelegate(APPROVAL_REASONS.ORIGIN_REQUIRED, 'delegated dispatch refused: the grant must bind task + origin before dispatch (nothing was sent)')
+      }
       try {
-        const snap = await sessionQuery.readSession(resolved.sessionId)
-        const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
-        baseline = baselineOf(events)
+        const grant = approvalStore.issueGrant({
+          originThreadId: task.originThreadId,
+          taskId: task.taskId,
+          scope: { kind: 'session', sessionId: resolved.sessionId },
+          ttlMs: typeof delegateOptions.ttlSec === 'number' ? delegateOptions.ttlSec * 1000 : undefined,
+          leaseMs: typeof delegateOptions.leaseSec === 'number' ? delegateOptions.leaseSec * 1000 : undefined,
+          credDigest,
+          authorization: delegateOptions.authorization,
+        })
+        approvalStore.audit({
+          type: 'grant', phase: 'issued', grantId: grant.grantId, taskId: task.taskId,
+          originThreadId: task.originThreadId, sessionId: resolved.sessionId,
+          authorization: grant.authorization, how: 'delegate-dispatch',
+        })
+        task.grantId = grant.grantId
+        task.grantExpiresAt = grant.expiresAt
+        task.grantLeaseUntil = grant.leaseUntil
       } catch (e) {
-        console.error('[dsh-bridge] session baseline read failed:', errText(e).slice(0, 200))
+        return failDelegate('grant-issue-failed', 'delegated dispatch refused: could not issue the task grant (' + errText(e) + ') — nothing was sent')
       }
     }
+
+    // Exact RPC/turn tracking needs only a sequence floor and open-turn metadata.
+    // Legacy callers still need their old text baseline, but borrow rather than clone it.
+    let baseline = { count: 0, textLen: 0 }
+    const cut = originThreadId !== undefined
+      ? await observations.refresh(resolved.sessionId, { fresh: true })
+      : await observations.capture(resolved.sessionId)
+    if (originThreadId === undefined && cut) baseline = baselineOf(cut.events)
     const record = {
-      sessionId: resolved.sessionId, taskId: task.taskId, deliver, baseline,
-      total: '', sawRunning: false, activeSince: Date.now(), startedAt: Date.now(),
-      settled: false, abort: undefined, watcher: 'pending',
+      sessionId: resolved.sessionId, taskId: task.taskId, deliver: mode, baseline,      total: '', sawRunning: false, activeSince: Date.now(), startedAt: Date.now(),
+      settled: false, abort: taskAbort, watcher: 'pending',
+      observedSeq: cut?.cursor ?? -1,
       // 精确关联模式（带来源）：靠 requestId→rpcId→turn 关联收结果，而不是派发前基线 + 全会话 idle。
       precise: originThreadId !== undefined,
-      tracker: createRequestTracker(task.taskId),
+      tracker: createRequestTracker(task.taskId, cut?.cursor),
       reported: 0,      // prompt 被接受 = 消息已进会话队列。此后就不该再把它当"没发出去"（见 sweepSessionTargets）。
       delivered: false, queuedNoted: false,
+      // 投递控制：回执记录与父任务同 turn，绝不参与审批归属、也绝不等父任务的最终结果。
+      receipt: mode === 'steer',
+      parentTaskId,
+      // 服务端捕获的目标父回合（B）：观察时以它为准，expectedTurn 只是可选校验。
+      parentTurn: task.parentTurn,
     }
-    sessionTargets.set(resolved.sessionId, record)
+    record.tracker.openTurns = openTurnsOf(cut?.evidence || cut?.events || [])
+    sessionTargets.set(task.taskId, record)
+    if (mode !== 'steer') watchSessionTask(record)
 
     try {
       const controllerRef = sessionControllerNow()
       if (controllerRef === undefined) {
-        sessionTargets.delete(resolved.sessionId)
+        sessionTargets.delete(task.taskId)
         record.settled = true
         task.status = 'error'
         task.error = 'sessionController service is not mounted in this profile'
@@ -908,12 +1943,14 @@ export async function apply(ctx) {
       await controllerRef.prompt({
         requestId: task.taskId,
         sessionId: resolved.sessionId,
-        mode: deliver,
+        mode,
         content: [{ type: 'text', text: instruction }],
-      }, signalOf())
+      }, taskAbort.signal)
+      // 模型路由耗尽时 abort 的是**这个**任务的作用域 signal：观察循环据此收口（不误伤别的任务）。
+      record.abort = taskAbort
     } catch (e) {
       const reason = mapControllerError(e)
-      sessionTargets.delete(resolved.sessionId)
+      sessionTargets.delete(task.taskId)
       record.settled = true
       task.status = 'error'
       task.error = errText(e)
@@ -922,14 +1959,22 @@ export async function apply(ctx) {
       return { task, failed: { reason, message: task.error, candidates: [] } }
     }
 
-    watchSessionTask(record)
     record.delivered = true
     task.delivered = true
-    pushTask(task.taskId, 'task-accepted', { target: { kind: 'session', sessionId: resolved.sessionId }, deliver, cwd: resolved.snippet, delivered: true })
+    if (mode === 'steer') {
+      // 回执：只观察"自己的 rpcId 落进父回合"（有界 ≤30s），不等父任务结果（父任务唯一拥有最终结果）。
+      void observeSteerReceipt(record, task)
+      pushTask(task.taskId, 'receipt-accepted', {
+        parentTaskId, requestId: task.taskId, deliver: 'steer', resultScope: 'parent-task',
+        target: { kind: 'session', sessionId: resolved.sessionId },
+      })
+      return { task, failed: null }
+    }
+    pushTask(task.taskId, 'task-accepted', { target: { kind: 'session', sessionId: resolved.sessionId }, deliver: mode, cwd: resolved.snippet, delivered: true })
     return { task, failed: null }
   }
 
-  const enqueue = async (instruction, incomingHistory, target, modelAlias, kind, deliveryMode, notes, originThreadId) => {
+  const enqueue = async (instruction, incomingHistory, target, modelAlias, kind, deliveryMode, notes, originThreadId, delegateOptions, steering, routePolicy) => {
     if (incomingHistory !== undefined) syncHistory(incomingHistory)
     if (target !== undefined && target.kind === 'session') {
       // session 目标：不注册工作区、不建 owner、不建子代理，失败也不降级为新建。
@@ -939,6 +1984,9 @@ export async function apply(ctx) {
         Array.isArray(notes) ? notes : [],
         incomingHistory,
         originThreadId,
+        delegateOptions,
+        steering,
+        routePolicy,
       )
       return dispatched.task
     }
@@ -948,7 +1996,7 @@ export async function apply(ctx) {
     const bucket = bucketOf(cwd, lane)
     // 同一通道（cwd+lane）只允许一个在途任务：完成事件只能定位到"这个桶里最老的 pending"，
     // 两个并发任务会让结果归属变成猜测。这里明确拒绝（上一任务结束后再派下一条；不同 lane 不受影响）。
-    const activeInBucket = tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
+    const activeInBucket = tasks.find((t) => (t.status === 'accepted' || t.status === 'running' || (t.status === 'unknown' && t.taskId === bucket.executingTaskId)) && t.bucketKey === bucket.key)
     if (activeInBucket !== undefined) {
       return rejectBusy({
         kind, instruction, cwd, lane, bucketKey: bucket.key,
@@ -978,17 +2026,51 @@ export async function apply(ctx) {
       pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, cwd, kind })
       return task
     }
+    // 模型路由（M2）：worker 也要在**首次请求之前**有归属——预先分配 childId 并登记计划，
+    // 由 agent/inbox/claimed 用真实 agent/owner 核对后绑定（provider 不支持预分配时不会误绑）。
+    if (routePolicy !== undefined) {
+      // worker 的 owner 必须在**登记路由之前**确定：claim 时用官方 isOwnedBy 核验，
+      // 拿不到可信 owner 就不登记（fail-closed，绝不按 childId 撞一个就算接管）。
+      const routeOwner = await ensureOwner(bucket)
+      const reuseChildId = bucket.childId !== null && bucket.childId !== undefined ? bucket.childId : null
+      const expectedChildId = reuseChildId !== null ? reuseChildId : 'dsh-bridge-child-' + uid()
+      const plan = await modelRouting.planRoute({
+        taskId: task.taskId, policy: routePolicy, kind, execution: 'worker', originThreadId, childId: expectedChildId,
+        expectedOwner: routeOwner !== undefined && routeOwner !== null && typeof routeOwner.id === 'string' ? routeOwner.id : undefined,
+        onTerminal: (info) => { task.routeStopReason = info !== null && typeof info === 'object' && typeof info.reason === 'string' ? info.reason : 'terminal' },
+        onExhausted: (reason) => { task.routeStopReason = reason },
+      })
+      bucket.expectedChildId = expectedChildId
+      const chosen = plan.selection !== null && plan.selection.ok === true ? { provider: plan.selection.pair.provider, model: plan.selection.pair.model } : null
+      const reason = plan.selection === null ? 'inherit' : plan.selection.reason
+      task.routePolicy = routePolicy
+      task.route = {
+        mode: routePolicy.mode,
+        allowFallback: routePolicy.allowFallback,
+        chosen,
+        reason,
+        expectedChildId,
+        ...(plan.selection !== null && plan.selection.ok !== true && Array.isArray(plan.selection.candidates) ? { candidates: plan.selection.candidates.slice(0, 5) } : {}),
+      }
+      // 精确指定但目录里没有 / 同名跨 provider 歧义 → **派活前拒绝**（与 session 目标同一契约）
+      if (routePolicy.mode === 'exact' && chosen === null) {
+        task.status = 'error'
+        task.error = 'exact model request cannot be satisfied from the registered catalog: ' + reason
+        task.reason = REASONS.MODEL_ROUTE_INVALID
+        task.candidates = task.route.candidates === undefined ? [] : task.route.candidates
+        pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, cwd, kind })
+        return task
+      }
+    }
     try {
-      const delivered = await deliver(bucket, instruction, ROLE_BRIEF(cwd), '[Codex 指令] ')
+      const delivered = await deliver(bucket, instruction, ROLE_BRIEF(cwd), '[Codex 指令] ', task.taskId)
       if (delivered.fallback) {
-        task.status = 'done'
-        task.result = delivered.output
-        task.stopReason = delivered.stopReason
-        task.fallback = delivered.fallbackNote
-        remember('user', instruction)
-        remember('assistant', task.result)
+        // 兜底路径**不再冒充成功**：worker 继续失败必须如实 error（不重派、不 one-shot 重做）。
+        task.status = 'error'
+        task.error = 'worker continuation degraded: ' + delivered.fallbackNote
+        task.reason = 'worker-continuation-degraded'
         persistTask(task)
-        pushTask(task.taskId, 'result', { text: task.result, stopReason: delivered.stopReason, childId: null, cwd, kind })
+        pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, cwd, kind })
       } else {
         bucket.activeSince = Date.now()
         pushTask(task.taskId, 'task-accepted', { childId: bucket.childId, cwd, kind })
@@ -1002,12 +2084,12 @@ export async function apply(ctx) {
     return task
   }
 
-  const submitReview = async (rawCwd, diff, focus, incomingHistory, originThreadId) => {
+  const submitReview = async (rawCwd, diff, focus, incomingHistory, originThreadId, routePolicy) => {
     if (incomingHistory !== undefined) syncHistory(incomingHistory)
     const cwd = normalizeCwd(rawCwd)
     const bucket = reviewerBucketOf(cwd)
     // 评审桶同理：同一目录只允许一个在途评审，否则完成结果无法归属到具体 taskId。
-    const activeReview = tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
+    const activeReview = tasks.find((t) => (t.status === 'accepted' || t.status === 'running' || (t.status === 'unknown' && t.taskId === bucket.executingTaskId)) && t.bucketKey === bucket.key)
     if (activeReview !== undefined) {
       return rejectBusy({
         kind: 'review', instruction: '(review rejected: channel busy)', cwd, lane: '@review', bucketKey: bucket.key,
@@ -1021,6 +2103,36 @@ export async function apply(ctx) {
     const instruction = ['【变更 diff】\n' + (typeof diff === 'string' && diff.trim() !== '' ? diff.slice(0, 60000) : '(未提供 diff)'), '【审查重点】\n' + (typeof focus === 'string' && focus.trim() !== '' ? focus.slice(0, 4000) : '(未指定,请按一般标准审查)')].join('\n\n')
     const task = { taskId: uid(), kind: 'review', instruction, cwd, lane: '@review', bucketKey: bucket.key, target: { kind: 'worker', cwd, lane: '@review' }, status: 'accepted', time: Date.now(), result: undefined, error: undefined }
     rememberTask(tasks, task)
+    // 模型路由（评审入口）：与编码走**同一任务级机制**——业务 kind='review'、执行目标 worker；
+    // 默认 auto 优先兼容 DeepSeek、支持显式 pair/default/禁 fallback、有界同 turn/step 恢复与独立审计。
+    if (routePolicy !== undefined) {
+      task.routePolicy = routePolicy
+      const routeOwner = await ensureOwner(bucket)
+      const reuseChildId = bucket.childId !== null && bucket.childId !== undefined ? bucket.childId : null
+      const expectedChildId = reuseChildId !== null ? reuseChildId : 'dsh-bridge-child-' + uid()
+      const plan = await modelRouting.planRoute({
+        taskId: task.taskId, policy: { ...routePolicy, taskKind: 'review' }, kind: 'review', execution: 'worker',
+        originThreadId, childId: expectedChildId,
+        expectedOwner: routeOwner !== undefined && routeOwner !== null && typeof routeOwner.id === 'string' ? routeOwner.id : undefined,
+        onExhausted: (reason) => { task.routeStopReason = reason },
+      })
+      bucket.expectedChildId = expectedChildId
+      const chosen = plan.selection !== null && plan.selection.ok === true ? { provider: plan.selection.pair.provider, model: plan.selection.pair.model } : null
+      const routeReason = plan.selection === null ? 'inherit' : plan.selection.reason
+      task.route = {
+        mode: routePolicy.mode, allowFallback: routePolicy.allowFallback, chosen, reason: routeReason,
+        ...(plan.selection !== null && plan.selection.ok !== true && Array.isArray(plan.selection.candidates) ? { candidates: plan.selection.candidates.slice(0, 5) } : {}),
+      }
+      // 精确指定但目录里没有 / 同名跨 provider 歧义 → 派活前拒绝（评审也不跑"另一个模型"）
+      if (routePolicy.mode === 'exact' && chosen === null) {
+        task.status = 'error'
+        task.error = 'exact model request cannot be satisfied from the registered catalog: ' + routeReason
+        task.reason = REASONS.MODEL_ROUTE_INVALID
+        task.candidates = task.route.candidates === undefined ? [] : task.route.candidates
+        pushTask(task.taskId, 'error', { error: task.error, reason: task.reason, cwd, kind: 'review' })
+        return task
+      }
+    }
     // 评审同样产生 taskId，因此同样支持来源关联；绑定失败不派活。
     const bound = bindAssociation(task, originThreadId)
     if (!bound.ok) {
@@ -1031,7 +2143,7 @@ export async function apply(ctx) {
       return task
     }
     try {
-      const delivered = await deliver(bucket, instruction, REVIEWER_BRIEF(cwd), '[评审请求] ')
+      const delivered = await deliver(bucket, instruction, REVIEWER_BRIEF(cwd), '[评审请求] ', task.taskId)
       if (delivered.fallback) {
         task.status = 'done'
         task.result = delivered.output
@@ -1055,32 +2167,39 @@ export async function apply(ctx) {
   }
 
   // assistantTextOf / textOfBlocks 由 session-target.mjs 提供（同一套语义，可单测）。
+  const observeWorkerEvent = (bucket, event) => {
+    if (event.seq <= (bucket.observedSeq ?? -1)) return
+    bucket.observedSeq = event.seq
+    const active = tasks.find(t => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
+    if (!active) return
+    bucket.activeSince = Date.now()
+    const text = assistantTextOf(event)
+    if (!text) return
+    bucket.progressTail = ((bucket.progressTail || '') + text + '\n').slice(-4000)
+    active.status = 'running'
+    pushTask(active.taskId, 'progress', { text, cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
+  }
   const pollOne = async (bucket) => {
     if (bucket.childId === null || sessionQuery === undefined) return
     const hasPending = tasks.some((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
-    let snap
-    try { snap = await sessionQuery.readSession(bucket.childId) } catch (e) { return }
-    const events = snap && Array.isArray(snap.events) ? snap.events : []
-    let total = ''
-    for (const e of events) total += assistantTextOf(e) + '\n'
-    const fresh = total.slice(bucket.lastSeen)
-    bucket.lastSeen = total.length
-    const newEvents = events.length > bucket.seenCount
-    bucket.seenCount = events.length
-    if (!hasPending) return
-    if (newEvents) bucket.activeSince = Date.now()
-    if (fresh.trim() !== '') {
-      const active = tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
-      if (active !== undefined) active.status = 'running'
-      pushTask(active !== undefined ? active.taskId : bucket.childId, 'progress', { text: fresh.trim(), cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
-    }
+    if (!hasPending) { bucket.observationAbort?.abort(); return }
+    const snap = await observations.since(bucket.childId, bucket.observedSeq ?? -1)
+    if (!snap) return
+    for (const event of snap.events) observeWorkerEvent(bucket, event)
+    bucket.observedSeq = Math.max(bucket.observedSeq ?? -1, snap.cursor)
+    const total = bucket.progressTail || ''
     if (bucket.activeSince > 0 && Date.now() - bucket.activeSince > 600000) {
       const active = tasks.find((t) => (t.status === 'accepted' || t.status === 'running') && t.bucketKey === bucket.key)
       if (active !== undefined && total.length > 0) {
-        active.status = 'done'
-        active.result = total.slice(Math.max(0, total.length - 4000)).trim() || '(无输出)'
+        active.status = 'unknown'
+        active.awaitingOfficialEnd = true
+        active.partialResult = total.trim()
+        active.reason = REASONS.UNCONFIRMED
+        active.resend = false
+        active.error = 'worker stopped producing progress without an official completion; do not resend'
         persistTask(active)
-        pushTask(active.taskId, 'result', { text: active.result, stopReason: 'quiet-timeout', childId: bucket.childId, cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
+        pushTask(active.taskId, 'unknown', { error: active.error, reason: active.reason, partialResult: active.partialResult, resend: false, stopReason: 'quiet-timeout', childId: bucket.childId, cwd: bucket.cwd, kind: bucket.lane === '@review' ? 'review' : 'task' })
+        bucket.observationAbort?.abort()
         bucket.activeSince = 0
       }
     }
@@ -1091,12 +2210,21 @@ export async function apply(ctx) {
       if (record.settled) continue
       const task = tasks.find((t) => t.taskId === record.taskId)
       if (task === undefined) { settleSessionTask(record, 'cancelled', {}); continue }
-      if (task.status === 'cancelled') { record.settled = true; if (record.abort !== undefined) { try { record.abort.abort() } catch (e) { /* ignore */ } } sessionTargets.delete(record.sessionId); continue }
+      if (task.status === 'cancelled') { record.settled = true; if (record.abort !== undefined) { try { record.abort.abort() } catch (e) { /* ignore */ } } sessionTargets.delete(record.taskId); continue }
       const now = Date.now()
+      // 回执（第四轮首次验收修正 C）：**绝不**进入通用执行收口。
+      // 它的生命周期只由 observeSteerReceipt/refreshReceiptNow 用"自身 rpcId 落进哪个回合"驱动，
+      // 因此这里既不喂通用 tracker（会累计父任务助手文本），也不允许 settleFromTracker 抢结算/落盘父结果。
+      if (record.receipt === true) continue
       // 精确关联模式：轮询/读日志只是观察机会，收尾只能由"自己那个 turn 的 turn/end"触发。
       if (record.precise === true) {
-        await observeSessionLog(record)
+        if (!observations.healthy(record.sessionId)) await observeSessionLog(record)
         if (record.settled) continue
+        // 按"自己的证据"推进 accepted/queued → running（全会话 running 事件只是机会，不是判定）。
+        if (record.receipt !== true && (task.status === 'accepted' || task.status === 'queued') && isExecutingRecord(record)) {
+          task.status = 'running'
+          pushTask(task.taskId, 'running', { target: { kind: 'session', sessionId: record.sessionId }, deliver: record.deliver })
+        }
         if (record.tracker.end !== undefined) { settleFromTracker(record); continue }
         if (record.watcher !== 'follow') pushPreciseProgress(record)
         if (!record.sawRunning && now - record.startedAt > SESSION_DISPATCH_TIMEOUT_MS && record.delivered === true && record.queuedNoted !== true) {
@@ -1112,9 +2240,26 @@ export async function apply(ctx) {
           settleSessionTask(record, 'error', { error: 'the session never accepted the prompt', reason: REASONS.NOT_ACCEPTED, delivered: false })
           continue
         }
+        // 等待审批期间：**不按 quiet/派发超时判完成或失败**（有效租约必须被尊重）；
+        // 观察预算 = 有效认证委托的 grant 有效期（blocker 3），未委托/失联/撤销/到期才回到旧预算。
+        const delegated = activeDelegatedGrantFor(task)
+        const budgetMs = observationBudgetMs(record, delegated)
+        if (task.status === 'needs-approval') {
+          if (now - record.startedAt > budgetMs) {
+            settleSessionTask(record, 'unknown', {
+              error: '等待审批超过了有效观察窗口（委托 grant 已到期/撤销/失联，或未委托时超过总预算）；执行状态未确认，不要重发（审批链已交还人工）',
+              reason: REASONS.UNCONFIRMED,
+              resend: false,
+              note: delegated === null ? 'approval wait exceeded SESSION_TOTAL_TIMEOUT_MS' : 'delegated grant window closed (' + delegated.grantId + ')',
+              ...(record.delivered === true ? { delivered: true } : {}),
+            })
+          }
+          continue
+        }
         // quiet / 总预算到期但**没有**自己 turn 的结束证据：只能报未确认（resend:false），绝不猜 done。
-        const quietExpired = record.sawRunning && record.activeSince > 0 && now - record.activeSince > SESSION_QUIET_TIMEOUT_MS
-        const budgetExpired = now - record.startedAt > SESSION_TOTAL_TIMEOUT_MS
+        // 有认证活跃委托时不做 quiet 判定（慢模型长时间无输出是正常的，grant 有效期才是界）。
+        const quietExpired = delegated === null && record.sawRunning && record.activeSince > 0 && now - record.activeSince > SESSION_QUIET_TIMEOUT_MS
+        const budgetExpired = now - record.startedAt > budgetMs
         if (quietExpired || budgetExpired) {
           settleSessionTask(record, 'unknown', {
             error: record.delivered === true
@@ -1130,8 +2275,9 @@ export async function apply(ctx) {
       }
       if (record.watcher === 'poll' && sessionQuery !== undefined) {
         try {
-          const snap = await sessionQuery.readSession(record.sessionId)
+          const snap = await observations.capture(record.sessionId)
           const events = snap !== undefined && snap !== null && Array.isArray(snap.events) ? snap.events : []
+          observeApprovalEvents(record.sessionId, events)
           const extracted = extractNewAssistantText(events, record.baseline)
           record.baseline = extracted.baseline
           if (extracted.text.trim() !== '') {
@@ -1141,6 +2287,21 @@ export async function apply(ctx) {
             pushTask(record.taskId, 'progress', { text: extracted.text, target: { kind: 'session', sessionId: record.sessionId } })
           }
         } catch (e) { /* 读不到就下一轮再试 */ }
+      }
+      // 等待审批期间不走 legacy 的 quiet/total/派发超时；观察预算同上（有效认证委托按 grant 有效期）。
+      const delegated = activeDelegatedGrantFor(task)
+      const budgetMs = observationBudgetMs(record, delegated)
+      if (task.status === 'needs-approval') {
+        if (now - record.startedAt > budgetMs) {
+          settleSessionTask(record, 'unknown', {
+            error: '等待审批超过了有效观察窗口（委托 grant 已到期/撤销/失联，或未委托时超过总预算）；执行状态未确认，不要重发（审批链已交还人工）',
+            reason: REASONS.UNCONFIRMED,
+            resend: false,
+            note: delegated === null ? 'approval wait exceeded SESSION_TOTAL_TIMEOUT_MS' : 'delegated grant window closed (' + delegated.grantId + ')',
+            ...(record.delivered === true ? { delivered: true } : {}),
+          })
+        }
+        continue
       }
       // 派发超时只在"prompt 没被接受"时才算失败。
       // queue 模式下 prompt 被接受就意味着消息已进队列，会在会话空闲时跑；此时报 error
@@ -1163,11 +2324,12 @@ export async function apply(ctx) {
           continue
         }
       }
-      if (record.sawRunning && record.activeSince > 0 && now - record.activeSince > SESSION_QUIET_TIMEOUT_MS) {
+      // 有认证活跃委托时不按 quiet 判完成（慢模型长时间无输出正常；grant 有效期才是界）。
+      if (delegated === null && record.sawRunning && record.activeSince > 0 && now - record.activeSince > SESSION_QUIET_TIMEOUT_MS) {
         finishSessionTask(record, 'quiet-timeout')
         continue
       }
-      if (now - record.startedAt > SESSION_TOTAL_TIMEOUT_MS) {
+      if (now - record.startedAt > budgetMs) {
         settleSessionTask(record, 'error', {
           error: record.delivered === true
             ? 'prompt 已投递进该会话队列，但预算内它始终没有开始这一轮（会话可能一直在忙，或未被激活）；不要重发，可用 status 继续观察'
@@ -1184,28 +2346,111 @@ export async function apply(ctx) {
   {
     ctx.effect(() => {
       const off = ctx.on('api-session/status', (sessionId, running) => {
-        const record = sessionTargets.get(sessionId)
-        if (record === undefined || record.settled) return
-        const task = tasks.find((t) => t.taskId === record.taskId)
-        if (running === true) {
-          record.sawRunning = true
-          record.activeSince = Date.now()
-          if (task !== undefined && task.status === 'accepted') task.status = 'running'
-          return
+        // 全会话 running/idle 只是"再观察一次"的机会（第四轮 D1）：绝不据此把同会话的其它任务标 running/done。
+        // 每个任务仍必须靠**自己**的 rpcId→turn/end 结算（settleFromTracker / finishSessionTask）。
+        for (const record of sessionRecords(sessionId)) {
+          const task = taskById(record.taskId)
+          if (task === undefined) continue
+          // 回执：共享 running/idle 只当"再看一眼自身证据"的机会，绝不进通用执行收口（C）。
+          if (record.receipt === true) {
+            if (running === true) record.sawRunning = true
+            void refreshReceiptNow(record, task)
+            continue
+          }
+          if (running === true) {
+            record.sawRunning = true
+            record.activeSince = Date.now()
+            // 先读一次日志把 rpcId 喂给关联器，再按"自己的证据"决定是否 running（否则会误标排队中的任务）。
+            void (async () => {
+              await observeSessionLog(record)
+              if (record.settled) return
+              if ((task.status === 'accepted' || task.status === 'queued') && isExecutingRecord(record)) {
+                task.status = 'running'
+                pushTask(task.taskId, 'running', { target: { kind: 'session', sessionId: record.sessionId }, deliver: record.deliver })
+              }
+            })()
+            continue
+          }
+          if (running === false && record.sawRunning) finishSessionTask(record, 'stop')
         }
-        if (running === false && record.sawRunning) finishSessionTask(record, 'stop')
       })
       return () => { if (typeof off === 'function') off() }
     })
   }
 
+  // ---- 正式审批接线（M0 证据：cordis:317-325 组合语义 / user-approval:176 waterfall /
+  //      acp:1116 无 callId 即 next / ui-approval:284 只在自己会话内接管）
+  // 1) tools/pre-execute 快照：真实参数的唯一来源（客户端不得代传）；只记录，原链透传。
+  ctx.effect(() => {
+    const off = ctx.on('tools/pre-execute', (exec, next) => {
+      try {
+        const session = exec !== null && typeof exec === 'object' && exec.agent !== undefined && exec.agent !== null ? exec.agent.session : undefined
+        const sessionId = session !== undefined && session !== null && typeof session.id === 'string' ? session.id : undefined
+        if (approvalStore !== null && typeof exec.callId === 'string' && exec.callId !== '' && sessionId !== undefined) {
+          // cwd：真实来源是 `exec.agent.session.header.cwd`（dsh-tools:1423 同一取值路径；dsh-session:1044 保证
+          // 为合法绝对路径）。exec 上**没有** cwd；exec.cwd 仅作镜像兜底，两者都没有 → 身份不完整（unsupported）。
+          let cwd
+          let cwdSource
+          const headerCwd = session.header !== undefined && session.header !== null ? session.header.cwd : undefined
+          if (typeof headerCwd === 'string' && headerCwd !== '') { cwd = headerCwd; cwdSource = 'agent.session.header.cwd' }
+          else if (typeof exec.cwd === 'string' && exec.cwd !== '') { cwd = exec.cwd; cwdSource = 'exec.cwd' }
+          // parent：官方真实字段（嵌套/PTC 派发时是父执行的 token；顶层通常没有）
+          approvalStore.snapshotCall({
+            sessionId, callId: exec.callId, rootCallId: exec.rootCallId, parent: exec.parent,
+            name: exec.name, args: exec.arguments, cwd, cwdSource,
+          })
+        }
+      } catch (e) {
+        // 快照失败绝不影响工具执行链
+        console.error('[dsh-bridge] approval snapshot failed:', errText(e).slice(0, 200))
+      }
+      return next()
+    })
+    return () => { if (typeof off === 'function') off() }
+  })
+
+  // 2) approval/request answerer：prepend 抢先注册；严格谓词不成立 → 立即 next()；
+  //    内部异常 → next()（绝不 throw：官方 decide 把 throw 归一成 unavailable，会跳过人工链）。
+  ctx.effect(() => {
+    const off = ctx.on('approval/request', (req, next) => {
+      try {
+        return handleApprovalRequest(req).then(
+          (outcome) => (typeof outcome === 'string' && outcome !== '' ? outcome : next()),
+          (e) => {
+            console.error('[dsh-bridge] approval answerer error → next():', errText(e).slice(0, 200))
+            return next()
+          },
+        )
+      } catch (e) {
+        console.error('[dsh-bridge] approval answerer error → next():', errText(e).slice(0, 200))
+        return next()
+      }
+    }, { prepend: true })
+    return () => {
+      // 卸载：把在途挂起项安全收口（绝不留下"可答但已无回调"的假状态）
+      try {
+        if (approvalStore !== null) approvalStore.closeLiveForTask(undefined, APPROVAL_STATES.SUPERSEDED, 'bridge plugin unloaded')
+      } catch (e) { /* ignore */ }
+      // 卸载后**零读取、零写盘**（第二次验收修正 3）：把所有观察记录标 settled 并立刻唤醒它们的等待，
+      // 这样首循环、后台续证、显式查询续证都立即停手，也不再空转定时器。
+      for (const record of Array.from(sessionTargets.values())) {
+        try { settleReceiptRecord(record) } catch (e) { /* ignore */ }
+      }
+      if (typeof off === 'function') off()
+    }
+  })
+
+  let sweeping = false
   if (timer !== undefined) {
     ctx.effect(() => timer.interval(() => {
+      if (sweeping) return
+      sweeping = true
       void (async () => {
         for (const bucket of buckets.values()) await pollOne(bucket)
         for (const bucket of reviewerBuckets.values()) await pollOne(bucket)
         await sweepSessionTargets()
-      })()
+        observations.prune()
+      })().catch((e) => console.error('[dsh-bridge] observation failed:', errText(e).slice(0, 200))).finally(() => { sweeping = false })
     }, 2500))
   }
 
@@ -1256,6 +2501,55 @@ export async function apply(ctx) {
         sendJson(res, 400, { error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', reason: ASSOC_REASONS.INVALID_ORIGIN })
         return
       }
+      // 审批委托（M1/M2）：`delegate:true` 必须由控制凭据鉴权（loopback/origin/task 都只是定位，
+      // 不自证授权）；worker 目标（child 身份未证明）、缺 key、缺来源一律在**发出 prompt 之前**拒绝
+      // ——零执行，绝不出现"派活后才发现没接审批"。
+      let delegateOptions
+      if (parsed !== null && typeof parsed === 'object' && parsed.delegate === true) {
+        const auth = approvalAuth(req)
+        if (auth.ok !== true) {
+          sendJson(res, 401, { error: 'delegated dispatch requires a valid control credential (initialize the control key first)', reason: auth.reason })
+          return
+        }
+        if (origin.originThreadId === undefined) {
+          sendJson(res, 400, { error: 'delegate requires originThreadId: the grant binds task + origin before anything is dispatched', reason: APPROVAL_REASONS.ORIGIN_REQUIRED })
+          return
+        }
+        if (classified.target.kind !== 'session') {
+          sendJson(res, 400, {
+            error: 'approval delegation does not support worker targets (the executing child identity is unproven); dispatch without delegate to keep the legacy worker path',
+            reason: APPROVAL_REASONS.UNSUPPORTED_TARGET,
+          })
+          return
+        }
+        delegateOptions = {
+          ttlSec: typeof parsed.delegateTtlSec === 'number' && parsed.delegateTtlSec > 0 ? Math.min(parsed.delegateTtlSec, 3600) : undefined,
+          leaseSec: typeof parsed.delegateLeaseSec === 'number' && parsed.delegateLeaseSec > 0 ? Math.min(parsed.delegateLeaseSec, 600) : undefined,
+          // 授权说明/工作范围：由**可信发起端**在这次已认证的派活里给出，随 grant 固定记录并回给审批模型。
+          authorization: typeof parsed.authorization === 'string' && parsed.authorization.trim() !== '' ? parsed.authorization.trim().slice(0, 500) : undefined,
+          credDigest: auth.credDigest,
+        }
+      }
+
+      // ---- 投递控制（第四轮）：steer 是"改动既有任务"的动作 → 必须有**认证发起端** + 显式父任务。
+      // 队列（默认）对来源绑定任务不要求凭据（旧非委托 queue 行为不变）；新字段遇旧网关由客户端预检拒绝。
+      let steering
+      if (classified.deliver === 'steer' || (parsed !== null && typeof parsed === 'object' && (parsed.parentTaskId !== undefined || parsed.expectedTurn !== undefined))) {
+        const auth = approvalAuth(req)
+        if (auth.ok !== true) {
+          sendJson(res, 401, { error: 'steer modifies an existing task and requires a valid control credential on the requesting client', reason: auth.reason })
+          return
+        }
+        const parentTaskId = parsed !== null && typeof parsed === 'object' && typeof parsed.parentTaskId === 'string' && parsed.parentTaskId.trim() !== '' ? parsed.parentTaskId.trim() : undefined
+        if (classified.deliver !== 'steer' && parentTaskId !== undefined) {
+          sendJson(res, 400, { error: 'parentTaskId is only valid with deliver="steer"', reason: REASONS.PARENT_REQUIRED })
+          return
+        }
+        steering = {
+          parentTaskId,
+          expectedTurn: parsed !== null && typeof parsed === 'object' && Number.isInteger(parsed.expectedTurn) ? parsed.expectedTurn : undefined,
+        }
+      }
       // dryRun：只解析目标、回显它，**不投递任何东西**。存在的意义是让"我这条查询会命中
       // 哪条会话"能纯只读地问出来——真实事故里调用方就是因为没法先验证，才发了一条占位
       // 消息去探测，结果污染了用户会话。
@@ -1295,21 +2589,46 @@ export async function apply(ctx) {
         })
         return
       }
-      const task = await enqueue(instruction, parsed.history, classified.target, parsed.model, 'task', classified.deliver, classified.notes, origin.originThreadId)
+      const routePolicy = parseRoutePolicy(parsed)
+      const task = await enqueue(instruction, parsed.history, classified.target, parsed.model, 'task', classified.deliver, classified.notes, origin.originThreadId, delegateOptions, steering, routePolicy)
       if (task.status === 'error') {
         sendJson(res, 400, {
           error: task.error,
           reason: task.reason,
           ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }),
           ...(task.delivered === true ? { delivered: true } : {}),
+          ...(task.route === undefined ? {} : { route: task.route }),
           ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
         })
         return
       }
       sendJson(res, 202, {
         ...taskResponse(task),
+        ...(task.route === undefined ? {} : { route: task.route }),
         model: classified.target.kind === 'worker' ? (parsed.model || null) : null,
       })
+    },
+  }))
+
+  // 只读模型目录（M2）：`GET /api/dsh-bridge/models` —— 不激活任何会话、不发起模型请求、不显示凭据/endpoint。
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/api/dsh-bridge/models',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
+      if (req.method !== 'GET' && req.method !== 'POST') { res.writeHead(405); res.end('GET or POST only'); return }
+      try {
+        const query = req.method === 'POST' ? ((await readJsonBody(req, res)) || {}) : qsOf(req)
+        const view = await modelRouting.modelsView({ force: query.force === true || query.force === 'true' })
+        sendJson(res, 200, {
+          ...view,
+          status: modelRouting.status().counters,
+          limits: modelRouting.limits,
+          routing: capabilityReport().modelRouting,
+        })
+      } catch (e) {
+        sendJson(res, 502, { ok: false, error: 'model catalog query failed', reason: 'model-catalog-failed', detail: errText(e).slice(0, 200) })
+      }
     },
   }))
 
@@ -1413,12 +2732,21 @@ export async function apply(ctx) {
         sendJson(res, 400, { error: 'originThreadId must be a non-empty string (<= 200 chars, no control characters)', reason: ASSOC_REASONS.INVALID_ORIGIN })
         return
       }
-      const task = await submitReview(parsed.cwd, parsed.diff, parsed.focus, parsed.history, origin.originThreadId)
+      const task = await submitReview(parsed.cwd, parsed.diff, parsed.focus, parsed.history, origin.originThreadId, parseRoutePolicy(parsed))
       if (task.status === 'error') {
-        sendJson(res, 400, { error: task.error, reason: task.reason, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) })
+        sendJson(res, 400, {
+          error: task.error, reason: task.reason,
+          ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }),
+          ...(task.route === undefined ? {} : { route: task.route }),
+          ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
+        })
         return
       }
-      sendJson(res, 202, { taskId: task.taskId, status: task.status, cwd: task.cwd, kind: 'review', ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) })
+      sendJson(res, 202, {
+        taskId: task.taskId, status: task.status, cwd: task.cwd, kind: 'review',
+        ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }),
+        ...(task.route === undefined ? {} : { route: task.route }),
+      })
     },
   }))
 
@@ -1486,10 +2814,36 @@ export async function apply(ctx) {
           return
         }
       }
+      // 投递控制（第四轮 D1）取消安全：
+      //  * steer 回执：取消回执 ≠ 取消父任务，且回执本身没有可撤回的官方入口 → 明确拒绝；
+      //  * queued 项：无法证明"逐项撤回"（官方只有 session 级 clear/cancel）→ 明确拒绝，绝不 cancel 整个会话去清队列。
+      if (task.deliver === 'steer' || task.status === 'queued') {
+        sendJson(res, 409, {
+          taskId,
+          cancelled: false,
+          reason: 'cancel-unsupported-for-queued',
+          error: task.deliver === 'steer'
+            ? 'cancelling a steer receipt is not supported: it is not the parent task, and the official API has no per-message retraction. Cancel the parent (if it is yours) or wait for it to finish.'
+            : 'cancelling a queued task is not supported: the official API only offers session-level cancel, which would also kill other tasks/queued items. Wait for it to run, or cancel the running task explicitly when it is the only one.',
+        })
+        return
+      }
       if (task.status !== 'accepted' && task.status !== 'running') { sendJson(res, 200, { taskId, cancelled: false, status: task.status, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) }); return }
 
       // session 目标动的是用户自己的对话：取消会打断他正在跑的回合，因此必须显式 force。
       if (task.target !== undefined && task.target.kind === 'session') {
+        // 多任务安全（第四轮 D1）：session cancel 会清掉整队列——只有"本会话没有别的在途任务"时才允许。
+        const others = sessionRecords(task.target.sessionId).filter((r) => r.taskId !== task.taskId)
+        if (others.length > 0) {
+          sendJson(res, 409, {
+            taskId,
+            cancelled: false,
+            reason: 'cancel-unsafe-with-other-tasks',
+            error: 'this session has ' + others.length + ' other in-flight/queued bridge task(s) (' + others.map((r) => r.taskId).join(', ') + '); a session-level cancel would kill them too, so cancelling this task is refused. Wait for them to finish or settle them first.',
+            otherTaskIds: others.map((r) => r.taskId),
+          })
+          return
+        }
         if (parsed.force !== true) {
           sendJson(res, 409, {
             taskId,
@@ -1510,7 +2864,7 @@ export async function apply(ctx) {
         }
         task.status = 'cancelled'
         task.cancelReason = 'cancelled by request (force)'
-        const record = sessionTargets.get(task.target.sessionId)
+        const record = recordForTask(taskId)
         if (record !== undefined) settleSessionTask(record, 'cancelled', {})
         persistTask(task)
         pushTask(taskId, 'cancelled', { target: { kind: 'session', sessionId: task.target.sessionId } })
@@ -1533,6 +2887,306 @@ export async function apply(ctx) {
       persistTask(task)
       pushTask(taskId, 'cancelled', { cwd: task.cwd })
       sendJson(res, 200, { taskId, cancelled: true, interrupted, ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }) })
+    },
+  }))
+
+  // ================================================================ 审批 HTTP（全部鉴权：私有 raw key）
+  // 边界：origin/task 只负责定位且**必须显式给出**（修正 D：空过滤不再顺手续所有任务租约、
+  // 不跨来源泄露）；真正的授权校验在 store.decide 里按 pending/grant 硬核对；
+  // 响应从不回显收到的头、raw key 或任何授权摘要；决定请求**不接受**任何参数副本。
+  const approvalCtx = (src, required = {}) => {
+    const origin = originOf(src)
+    if (!origin.ok || origin.originThreadId === undefined) {
+      return { ok: false, status: 400, reason: ASSOC_REASONS.INVALID_ORIGIN, error: 'originThreadId is required (a non-empty string) — it locates the task; it never authorizes by itself' }
+    }
+    const taskId = typeof src.taskId === 'string' ? src.taskId.trim() : ''
+    if (taskId === '') {
+      return { ok: false, status: 400, reason: APPROVAL_REASONS.TASK_REQUIRED, error: 'taskId is required together with originThreadId' }
+    }
+    const out = { ok: true, originThreadId: origin.originThreadId, taskId }
+    for (const key of ['grantId', 'approvalKey', 'sessionId']) {
+      if (required[key] === true) {
+        const value = typeof src[key] === 'string' ? src[key].trim() : ''
+        if (value === '') return { ok: false, status: 400, reason: 'bad-input', error: key + ' is required' }
+        out[key] = value
+      } else if (typeof src[key] === 'string' && src[key].trim() !== '') {
+        out[key] = src[key].trim()
+      }
+    }
+    return out
+  }
+
+  const ensureGrantView = (grant, credDigest) => (grant !== undefined && grant !== null && grant.credDigest === credDigest)
+
+  ctx.effect(() => webServer.register({
+    kind: 'prefix',
+    path: '/api/dsh-bridge/approvals',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) { res.writeHead(403); res.end('forbidden'); return }
+      const auth = approvalAuth(req)
+      if (auth.ok !== true) {
+        sendJson(res, 401, { ok: false, error: 'a valid control credential is required for approval operations', reason: auth.reason })
+        return
+      }
+      if (approvalStore === null) { sendJson(res, 503, { ok: false, error: 'approval store unavailable' }); return }
+      if (approvalStore.grantLogHealthy() !== true) {
+        // 权限记录受损 → 安全失败（不基于受损记录做任何判断）
+        sendJson(res, 503, { ok: false, error: 'authorization records are damaged; refusing to act until repaired', reason: APPROVAL_REASONS.GRANT_LOG_CORRUPT })
+        return
+      }
+      const credDigest = auth.credDigest
+      const url = new URL(req.url, 'http://127.0.0.1')
+      const sub = url.pathname.slice('/api/dsh-bridge/approvals'.length)
+      const now = Date.now()
+
+      // ---- 清单（必须显式 origin+task；续租/续期只作用于本次查询显式命中的 grant）
+      if (sub === '' || sub === '/') {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: 'GET required' }); return }
+        const qs = qsOf(req)
+        const scope = approvalCtx(qs)
+        if (scope.ok !== true) { sendJson(res, scope.status, { ok: false, error: scope.error, reason: scope.reason }); return }
+        const extendSec = Number(qs.extendSec)
+        const renew = qs.renew === '1' || qs.renew === 'true'
+        const grantFilter = { originThreadId: scope.originThreadId, taskId: scope.taskId }
+        if (scope.grantId !== undefined) grantFilter.grantId = scope.grantId
+        if (scope.sessionId !== undefined) grantFilter.sessionId = scope.sessionId
+        const scoped = approvalStore.listGrants(grantFilter).filter((g) => ensureGrantView(g, credDigest))
+        const renewed = []
+        const extended = []
+        for (const g of scoped) {
+          if (g.status !== 'active' || now > g.expiresAt) continue
+          const r = approvalStore.renewLease({ grantId: g.grantId, taskId: g.taskId, originThreadId: g.originThreadId, sessionId: g.scope.sessionId, credDigest, now })
+          if (r.ok === true) renewed.push(g.grantId)
+          if (renew) {
+            const e = approvalStore.renewGrant({ grantId: g.grantId, taskId: g.taskId, originThreadId: g.originThreadId, sessionId: g.scope.sessionId, credDigest, extendSec: Number.isFinite(extendSec) && extendSec > 0 ? extendSec : undefined, now })
+            if (e.ok === true) extended.push({ grantId: g.grantId, expiresAt: e.grant.expiresAt, leaseUntil: e.grant.leaseUntil, cap: e.cap })
+          }
+        }
+        const pendings = approvalStore.listPending({
+          originThreadId: scope.originThreadId, taskId: scope.taskId,
+          ...(scope.grantId === undefined ? {} : { grantId: scope.grantId }),
+          ...(scope.sessionId === undefined ? {} : { sessionId: scope.sessionId }),
+        }).filter((p) => ensureGrantView(approvalStore.getGrant(p.grantId), credDigest))
+        sendJson(res, 200, {
+          ok: true,
+          now,
+          renewHint: 'authenticated list/detail/decide calls renew the lease; pass renew=1 (or the /renew route) to extend the absolute grant TTL inside the authorized window',
+          renewedGrants: renewed,
+          extendedGrants: extended,
+          grants: scoped.map((g) => ({
+            grantId: g.grantId, version: g.version, status: g.status, taskId: g.taskId,
+            originThreadId: g.originThreadId, sessionId: g.scope.sessionId,
+            authorization: g.authorization,
+            issuedAt: g.issuedAt, expiresAt: g.expiresAt, leaseUntil: g.leaseUntil,
+            ...(g.revokedAt === undefined ? {} : { revokedAt: g.revokedAt, revokeReason: g.revokeReason }),
+          })),
+          approvals: pendings.map((p) => approvalStore.pendingView(p)),
+          unanswerable: approvalStore.unansweredFromAudit()
+            .filter((u) => u.originThreadId === undefined || (u.originThreadId === scope.originThreadId && (u.taskId === undefined || u.taskId === scope.taskId))),
+        })
+        return
+      }
+
+      // ---- 为**已存在且已绑定来源**的任务显式启用委托（不再允许给 unbound 任务随意声明 origin）
+      if (sub === '/enable') {
+        if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'POST required' }); return }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const scope = approvalCtx(body, { sessionId: true })
+        if (scope.ok !== true) { sendJson(res, scope.status, { ok: false, error: scope.error, reason: scope.reason }); return }
+        const task = tasks.find((t) => t.taskId === scope.taskId)
+        if (task === undefined) {
+          sendJson(res, 404, { ok: false, error: 'unknown task in this gateway (enable cannot invent a binding)', reason: 'task-not-found' })
+          return
+        }
+        if (task.target === undefined || task.target.kind !== 'session' || task.target.sessionId !== scope.sessionId) {
+          sendJson(res, 400, { ok: false, error: 'the grant scope must equal the task session target', reason: APPROVAL_REASONS.GRANT_SCOPE_MISMATCH })
+          return
+        }
+        if (task.originThreadId === undefined) {
+          sendJson(res, 400, { ok: false, error: 'this task has no source binding; delegation requires a task that was dispatched with originThreadId', reason: APPROVAL_REASONS.ORIGIN_REQUIRED })
+          return
+        }
+        if (task.originThreadId !== scope.originThreadId) {
+          sendJson(res, 403, { ok: false, error: 'task is bound to another source conversation', reason: APPROVAL_REASONS.ORIGIN_MISMATCH })
+          return
+        }
+        const existing = approvalStore.listGrants({ originThreadId: scope.originThreadId, taskId: scope.taskId, sessionId: scope.sessionId, activeOnly: true })
+          .find((g) => ensureGrantView(g, credDigest) && g.expiresAt > now)
+        if (existing !== undefined) {
+          sendJson(res, 200, { ok: true, reused: true, grantId: existing.grantId, version: existing.version, expiresAt: existing.expiresAt, leaseUntil: existing.leaseUntil, taskId: scope.taskId, originThreadId: scope.originThreadId, sessionId: scope.sessionId, authorization: existing.authorization })
+          return
+        }
+        try {
+          const grant = approvalStore.issueGrant({
+            originThreadId: scope.originThreadId,
+            taskId: scope.taskId,
+            scope: { kind: 'session', sessionId: scope.sessionId },
+            ttlMs: typeof body.ttlSec === 'number' && body.ttlSec > 0 ? Math.min(body.ttlSec, 3600) * 1000 : undefined,
+            leaseMs: typeof body.leaseSec === 'number' && body.leaseSec > 0 ? Math.min(body.leaseSec, 600) * 1000 : undefined,
+            credDigest,
+            authorization: typeof body.authorization === 'string' ? body.authorization : undefined,
+          })
+          approvalStore.audit({ type: 'grant', phase: 'issued', grantId: grant.grantId, taskId: scope.taskId, originThreadId: scope.originThreadId, sessionId: scope.sessionId, authorization: grant.authorization, how: 'enable-route' })
+          sendJson(res, 200, { ok: true, grantId: grant.grantId, version: grant.version, expiresAt: grant.expiresAt, leaseUntil: grant.leaseUntil, taskId: scope.taskId, originThreadId: scope.originThreadId, sessionId: scope.sessionId, authorization: grant.authorization })
+        } catch (e) {
+          sendJson(res, 500, { ok: false, error: errText(e), reason: 'grant-issue-failed' })
+        }
+        return
+      }
+
+      // ---- 撤销（立刻失效，含在途 pending 收口）
+      const revokeMatch = /^\/grants\/([A-Za-z0-9-]+)\/revoke$/.exec(sub)
+      if (revokeMatch !== null) {
+        if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'POST required' }); return }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const scope = approvalCtx(body, { grantId: true })
+        if (scope.ok !== true) { sendJson(res, scope.status, { ok: false, error: scope.error, reason: scope.reason }); return }
+        const grantId = revokeMatch[1]
+        if (grantId !== scope.grantId) { sendJson(res, 400, { ok: false, error: 'grantId must match the route', reason: APPROVAL_REASONS.GRANT_SCOPE_MISMATCH }); return }
+        const grant = approvalStore.getGrant(grantId)
+        if (grant === undefined || !ensureGrantView(grant, credDigest)) {
+          sendJson(res, 404, { ok: false, error: 'grant not found for this credential', reason: APPROVAL_REASONS.GRANT_MISSING })
+          return
+        }
+        if (grant.taskId !== scope.taskId || grant.originThreadId !== scope.originThreadId) {
+          sendJson(res, 403, { ok: false, error: 'grant belongs to another task/source', reason: APPROVAL_REASONS.GRANT_SCOPE_MISMATCH })
+          return
+        }
+        const result = approvalStore.revokeGrant(grantId, typeof body.reason === 'string' ? body.reason : 'revoked via route')
+        approvalStore.audit({ type: 'grant', phase: 'revoked', grantId, taskId: grant.taskId, originThreadId: grant.originThreadId, reason: typeof body.reason === 'string' ? body.reason.slice(0, 200) : 'revoked via route' })
+        sendJson(res, 200, { ok: result.ok === true, grantId, status: 'revoked', ...(result.reason === undefined ? {} : { reason: result.reason }) })
+        return
+      }
+
+      // ---- 认证续期（在原授权窗口内显式延长绝对 TTL；不靠后台无限续租）
+      const renewMatch = /^\/grants\/([A-Za-z0-9-]+)\/renew$/.exec(sub)
+      if (renewMatch !== null) {
+        if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'POST required' }); return }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const scope = approvalCtx(body, { grantId: true })
+        if (scope.ok !== true) { sendJson(res, scope.status, { ok: false, error: scope.error, reason: scope.reason }); return }
+        const grantId = renewMatch[1]
+        if (grantId !== scope.grantId) { sendJson(res, 400, { ok: false, error: 'grantId must match the route', reason: APPROVAL_REASONS.GRANT_SCOPE_MISMATCH }); return }
+        const grant = approvalStore.getGrant(grantId)
+        if (grant === undefined || !ensureGrantView(grant, credDigest)) {
+          sendJson(res, 404, { ok: false, error: 'grant not found for this credential', reason: APPROVAL_REASONS.GRANT_MISSING })
+          return
+        }
+        const result = approvalStore.renewGrant({
+          grantId, taskId: scope.taskId, originThreadId: scope.originThreadId, sessionId: grant.scope.sessionId, credDigest,
+          extendSec: typeof body.extendSec === 'number' && body.extendSec > 0 ? Math.min(body.extendSec, 3600) : undefined,
+          now,
+        })
+        if (result.ok !== true) { sendJson(res, 409, { ok: false, reason: result.reason }); return }
+        approvalStore.audit({ type: 'grant', phase: 'renewed', grantId, taskId: grant.taskId, originThreadId: grant.originThreadId, expiresAt: result.grant.expiresAt })
+        sendJson(res, 200, { ok: true, grantId, expiresAt: result.grant.expiresAt, leaseUntil: result.grant.leaseUntil, cap: result.cap })
+        return
+      }
+
+      // ---- 决定（严格入参；身份/版本/指纹/上下文由 store.decide 硬核对）
+      const decideMatch = /^\/([A-Za-z0-9-]+)\/decide$/.exec(sub)
+      if (decideMatch !== null) {
+        if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'POST required' }); return }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const allowedKeys = new Set(['originThreadId', 'taskId', 'grantId', 'grantVersion', 'fingerprint', 'decision', 'idempotencyKey'])
+        const extra = Object.keys(body).filter((k) => !allowedKeys.has(k))
+        if (extra.length > 0) {
+          // 参数副本/歧义入参一律拒绝（绝不"默默接受后按原命令批准"）
+          sendJson(res, 400, { ok: false, error: 'unexpected fields are not accepted on a decision: ' + extra.join(','), reason: APPROVAL_REASONS.EXTRA_FIELDS })
+          return
+        }
+        const scope = approvalCtx(body, { grantId: true })
+        if (scope.ok !== true) { sendJson(res, scope.status, { ok: false, error: scope.error, reason: scope.reason }); return }
+        const approvalKey = decideMatch[1]
+        const pending = approvalStore.getPending(approvalKey)
+        if (pending === undefined) {
+          sendJson(res, 404, { ok: false, error: 'no live approval with that key (a restart loses live callbacks; wait for a fresh request)', reason: APPROVAL_REASONS.PENDING_MISSING })
+          return
+        }
+        if (pending.grantId !== scope.grantId || pending.taskId !== scope.taskId || pending.originThreadId !== scope.originThreadId) {
+          sendJson(res, 403, { ok: false, error: 'this approval belongs to another task/source/grant', reason: APPROVAL_REASONS.GRANT_SCOPE_MISMATCH })
+          return
+        }
+        if (body.decision !== DECISIONS.APPROVE_ONCE && body.decision !== DECISIONS.REJECT) {
+          sendJson(res, 400, { ok: false, error: 'decision must be approve-once or reject', reason: 'unknown-decision' })
+          return
+        }
+        if (typeof body.fingerprint !== 'string' || body.fingerprint === '') {
+          sendJson(res, 400, { ok: false, error: 'fingerprint is required (from GET /approvals/<key>)', reason: APPROVAL_REASONS.FINGERPRINT_MISMATCH })
+          return
+        }
+        // 认证 + 匹配该委托 → 续租（这是"活跃 RPC 有界续租"的唯一途径）
+        approvalStore.renewLease({ grantId: pending.grantId, taskId: pending.taskId, originThreadId: pending.originThreadId, sessionId: pending.sessionId, credDigest, now })
+        // 当前 turn/step 必须由**日志实时**给出：只比 coarse snapshotId 会漏掉 step-only 变化（root 复现）。
+        // 日志不可读/无 tool/call → 身份不可证明 → 明确拒绝（绝不当作可放行）。
+        const decideEvents = await readSessionEvents(pending.sessionId)
+        const live = approvalStore.getSnapshot(pending.sessionId, pending.callId)
+        const currentTurnStep = decideEvents === null ? null : resolveTurnStepFrom(decideEvents, pending.callId)
+        if (currentTurnStep === null) {
+          sendJson(res, 409, {
+            ok: false,
+            reason: APPROVAL_REASONS.IDENTITY_UNKNOWN,
+            error: 'the current execution identity cannot be proven right now (session log unreadable or no tool/call for this callId); refusing the decision instead of guessing',
+          })
+          return
+        }
+        const result = approvalStore.decide({
+          approvalKey,
+          fingerprint: body.fingerprint,
+          decision: body.decision,
+          idempotencyKey: typeof body.idempotencyKey === 'string' && body.idempotencyKey !== '' ? body.idempotencyKey.slice(0, 120) : undefined,
+          credDigest,
+          originThreadId: scope.originThreadId,
+          taskId: scope.taskId,
+          grantVersion: typeof body.grantVersion === 'number' ? body.grantVersion : undefined,
+          currentSnapshotId: live === undefined ? undefined : live.snapshotId,
+          currentTurnStep,
+          now,
+        })
+        if (result.ok !== true) {
+          sendJson(res, 409, { ok: false, reason: result.reason, ...(result.state === undefined ? {} : { state: result.state }) })
+          return
+        }
+        sendJson(res, 200, {
+          ok: true,
+          phase: 'submitted',
+          state: result.state,
+          outcome: result.outcome,
+          approvalKey,
+          ...(result.idempotent === true ? { idempotent: true } : {}),
+          confirmationHint: body.decision === DECISIONS.REJECT
+            ? '提交 ≠ 终态：reject 的官方终态是 rejected（approval/decided, outcome=rejected）；轮询该审批看到 state=rejected 即已收敛，不要去等只对批准有意义的 confirmed'
+            : 'submitted ≠ confirmed: re-query this approval; state=confirmed means the official approval/decided was observed with allowed-once, decision-unknown means confirmation was lost (do not re-send)',
+        })
+        return
+      }
+
+      // ---- 详情（鉴权 + origin/task 硬核对 + 续租）
+      const detailMatch = /^\/([A-Za-z0-9-]+)$/.exec(sub)
+      if (detailMatch !== null) {
+        if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: 'GET required' }); return }
+        const scope = approvalCtx(qsOf(req))
+        if (scope.ok !== true) { sendJson(res, scope.status, { ok: false, error: scope.error, reason: scope.reason }); return }
+        const pending = approvalStore.getPending(detailMatch[1])
+        if (pending === undefined) {
+          sendJson(res, 404, { ok: false, error: 'no live approval with that key', reason: APPROVAL_REASONS.PENDING_MISSING })
+          return
+        }
+        const g = approvalStore.getGrant(pending.grantId)
+        if (!ensureGrantView(g, credDigest) || pending.taskId !== scope.taskId || pending.originThreadId !== scope.originThreadId) {
+          sendJson(res, 403, { ok: false, error: 'this approval is not visible for this credential/task/source', reason: APPROVAL_REASONS.GRANT_SCOPE_MISMATCH })
+          return
+        }
+        approvalStore.renewLease({ grantId: g.grantId, taskId: g.taskId, originThreadId: g.originThreadId, sessionId: g.scope.sessionId, credDigest, now })
+        sendJson(res, 200, { ok: true, approval: approvalStore.pendingView(pending) })
+        return
+      }
+
+      sendJson(res, 404, { ok: false, error: 'unknown approval route' })
     },
   }))
 
@@ -1567,13 +3221,30 @@ export async function apply(ctx) {
               return
             }
           }
-          const record = task.target !== undefined && task.target.kind === 'session' ? sessionTargets.get(task.target.sessionId) : undefined
+          const record = recordForTask(task.taskId)
+          // 回执：**每次显式查询都是一次官方证据机会**（第四轮首次验收修正 C）——长工具结束后
+          // 同一父回合里的迟到 rpc 不会因为"单次等待窗口已过"而永久停留在未确认。
+          if (record !== undefined && record.receipt === true) await refreshReceiptNow(record, task)          // 委托等待循环需要**当前**的 grant 定位/租约（第三轮修正 A）：每次 status 都从存储刷新，
+          // 这样客户端能按真实 lease 剩余时间自适应续租（固定 10s 会放过 1–5s 的短租约）。
+          const grantView = delegatedGrantView(task)
           sendJson(res, 200, {
             taskId: task.taskId, status: task.status, kind: task.kind, cwd: task.cwd, lane: task.lane,
             target: task.target, deliver: task.deliver, instruction: task.instruction.slice(0, 300),
             result: task.result, error: task.error, reason: task.reason, fallback: task.fallback,
             // delivered=true 表示 prompt 已被会话接受（进了队列）——即便后面报错也不要重发。
             ...(task.delivered === undefined ? {} : { delivered: task.delivered }),
+            ...(grantView === null ? {} : { grantId: grantView.grantId, grantStatus: grantView.status, grantExpiresAt: grantView.expiresAt, grantLeaseUntil: grantView.leaseUntil }),
+            // 投递控制（第四轮）：排队任务与补充回执的真实状态（重启后也能查）
+            ...(task.requestedMode === undefined && task.deliver === undefined ? {} : { deliver: task.requestedMode !== undefined ? task.requestedMode : task.deliver }),
+            ...(task.parentTaskId === undefined ? {} : { parentTaskId: task.parentTaskId }),
+            ...(task.receiptState === undefined ? {} : { receiptState: task.receiptState }),
+            ...(Number.isInteger(task.observedTurn) ? { observedTurn: task.observedTurn } : {}),
+            ...(task.resultScope === undefined ? {} : { resultScope: task.resultScope }),
+            // 动态模型路由（M2）：真实选择 + 切换次数/原因 + **跨重启可查**的审计尾部（只有稳定 code，无正文）
+            ...(task.route === undefined ? {} : { route: task.route }),
+            ...(task.routeStopReason === undefined ? {} : { routeStopReason: task.routeStopReason }),
+            routeAudit: readRouteAudit(task.taskId, 20),
+            routeAuditWindow: { maxBytes: 1024 * 1024, truncated: routeAuditReader.status().truncated },
             ...(task.originThreadId === undefined ? {} : { originThreadId: task.originThreadId }),
             ...(task.requestId === undefined ? {} : { requestId: task.requestId }),
             ...(task.dshTurn === undefined ? {} : { dshTurn: task.dshTurn }),
@@ -1584,6 +3255,10 @@ export async function apply(ctx) {
             ...(task.associationError === undefined ? {} : { associationError: task.associationError }),
             ...(task.matchedBy === undefined ? {} : { matchedBy: task.matchedBy }),
             ...(Array.isArray(task.candidates) && task.candidates.length > 0 ? { candidates: task.candidates } : {}),
+            // 审批等待态：非终态；只回非敏感能力/计数（approvalKey 等正文必须走鉴权审批接口取）。
+            ...(task.status === 'needs-approval' || Array.isArray(task.approvalKeys)
+              ? { needsApproval: task.status === 'needs-approval', approvalPendingCount: typeof task.approvalPendingCount === 'number' ? task.approvalPendingCount : 0, approvalsPath: '/api/dsh-bridge/approvals' }
+              : {}),
             ...(record === undefined ? {} : { watcher: record.watcher, sawRunning: record.sawRunning }),
           })
           return
@@ -1606,23 +3281,52 @@ export async function apply(ctx) {
         }
         const record = stored.record
         const terminal = record.status === 'done' || record.status === 'error' || record.status === 'cancelled'
+        // 投递控制（第四轮首次验收修正 A）：回执的"自身已被观察到"是**独立于父任务执行**的持久事实，
+        // 重启后不能降级成 unknown（列表视图与单任务查询必须是同一套投影）。
+        const receiptView = record.deliver === 'steer'
+          ? {
+              deliver: 'steer',
+              resultScope: record.resultScope === undefined ? 'parent-task' : record.resultScope,
+              ...(record.parentTaskId === undefined ? {} : { parentTaskId: record.parentTaskId }),
+              ...(record.receiptState === undefined ? {} : { receiptState: record.receiptState }),
+              ...(record.observedTurn === undefined ? {} : { observedTurn: record.observedTurn }),
+              ...(record.requestSeq === undefined ? {} : { requestSeq: record.requestSeq }),
+            }
+          : {}
+        const receiptStatus = record.deliver !== 'steer' ? undefined
+          : (record.receiptState === 'observed' ? 'receipt-observed'
+            : (record.receiptState === 'deviated' ? 'receipt-deviated'
+              : (record.receiptState === 'unconfirmed' ? 'receipt-unconfirmed' : 'receipt-pending')))
         sendJson(res, 200, {
           taskId: record.taskId,
           originThreadId: record.originThreadId,
           kind: record.kind,
           target: record.target,
           ...(record.profile === undefined ? {} : { profile: record.profile }),
+          ...receiptView,
+          // 模型路由（第一版验收修正）：执行状态可以是 unknown（不谎报），但**审计事实必须仍可按 origin/task 取回**。
+          ...(record.route === undefined || record.route === null ? {} : { route: record.route }),
+          ...(record.routePolicy === undefined || record.routePolicy === null ? {} : { routePolicy: record.routePolicy }),
+          ...(record.routeStopReason === undefined ? {} : { routeStopReason: record.routeStopReason }),
+          routeAudit: readRouteAudit(record.taskId, 20),
+          routeAuditWindow: { maxBytes: 1024 * 1024, truncated: routeAuditReader.status().truncated },
           // 非终态记录：**不谎报已完成**，也不重新观察（未实现），明确标未知并禁止重发。
-          status: terminal ? record.status : 'unknown',
+          // 回执例外：自身已观察到的回执**不**降级（父任务执行状态仍可 unknown）。
+          status: receiptStatus !== undefined ? receiptStatus : (terminal ? record.status : 'unknown'),
           persistedStatus: record.status,
           recovered: true,
-          ...(terminal
-            ? {}
-            : {
-                reason: 'execution-state-unconfirmed',
-                note: '这条任务在执行/交付未确认前就失去了运行时上下文（网关重载或新实例）；不重发、不重新观察。原目标见 target。',
+          ...(receiptStatus !== undefined
+            ? {
                 resend: false,
-              }),
+                note: '补充回执的自身证据已持久化（收据/回合/来源是两维事实）；父任务的执行结果请查父 task。',
+              }
+            : (terminal
+              ? {}
+              : {
+                  reason: 'execution-state-unconfirmed',
+                  note: '这条任务在执行/交付未确认前就失去了运行时上下文（网关重载或新实例）；不重发、不重新观察。原目标见 target。',
+                  resend: false,
+                })),
           ...(record.delivered === undefined ? {} : { delivered: record.delivered }),
           ...(record.requestId === undefined ? {} : { requestId: record.requestId }),
           ...(record.dshTurn === undefined ? {} : { dshTurn: record.dshTurn }),
@@ -1651,12 +3355,12 @@ export async function apply(ctx) {
         })
         return
       }
-      const pending = tasks.filter((t) => t.status === 'accepted' || t.status === 'running').length
+      const pending = tasks.filter((t) => isNonTerminal(t)).length
       sendJson(res, 200, {
         pending,
         lanes: Array.from(buckets.keys()),
         reviewers: Array.from(reviewerBuckets.keys()),
-        sessions: Array.from(sessionTargets.keys()),
+        sessions: Array.from(new Set(Array.from(sessionTargets.values()).map((r) => r.sessionId))),
         sessionController: sessionControllerNow() !== undefined,
         capabilities: capabilityReport(),
         tasks: tasks.slice(-20).map((t) => ({ taskId: t.taskId, kind: t.kind, status: t.status, cwd: t.cwd, lane: t.lane, target: t.target, deliver: t.deliver })),
@@ -1678,8 +3382,11 @@ export async function apply(ctx) {
         services: Object.fromEntries(['sessionController', 'connection', 'sessionQuery', 'sessionPersistence', 'workspaceRegistry', 'agents', 'subagents', 'agentPresets', 'timer', 'llm'].map((n) => [n, probe(n)])),
         sessionTargets: [], models: knownModels, modelProvider, modelListError, workspaces: [],
         capabilities: capabilityReport(),
+        observation: observations.status(),
+        bridgeVersion,
+        routeAuditTail: routeAuditReader.status(),
       }
-      out.pending = tasks.filter((t) => t.status === 'accepted' || t.status === 'running').length
+      out.pending = tasks.filter((t) => isNonTerminal(t)).length
       try { out.providers = subagents.list() } catch (e) { out.providers = ['list failed: ' + errText(e)] }
       if (agentPresets !== undefined) {
         try {
@@ -1767,7 +3474,9 @@ export async function apply(ctx) {
       model: { type: 'string', description: '模型别名: default | fast | pro。' },
       sessionId: { type: 'string', description: '已有会话 id:把指令投递进这条会话,而不是新建。' },
       sessionQuery: { type: 'string', description: '按标题/内容搜索已有会话(唯一命中才生效,多条或落空会返回候选)。' },
-      deliver: { type: 'string', description: "投递方式: queue(默认,排队) 或 steer(插入当前回合)。" },
+      deliver: { type: 'string', description: "投递方式: queue(默认,排队,忙时也可靠接收) 或 steer(作为**补充回执**插进父任务当前回合)。" },
+      parentTaskId: { type: 'string', description: 'steer 必填: 被补充的父任务 id(dsh_collab_send 返回)。父必须同 origin/同会话且**正在执行**(官方日志证据);绝不按"最近/最老任务"推断。' },
+      expectedTurn: { type: 'number', description: 'steer 可选: 期望父任务当前 turn;与实际不符则零投递拒绝。' },
       dryRun: { type: 'boolean', description: '为 true 时只解析目标并回显(含 matchedBy 与候选),不投递任何消息——验证命中用它。' },
       originThreadId: { type: 'string', description: '发起本任务的 Codex 对话 id(来源关联)。必须是显式传入的非空字符串——不要用常驻进程环境或"最近对话"推断。用于之后按 origin+taskId 精确收取结果。' },
       wait: { type: 'boolean', description: '为 true 时等待结果(最长 15 分钟)。' },
@@ -1798,7 +3507,34 @@ export async function apply(ctx) {
         const lane = normalizeLane(classified.target.lane)
         return { ok: true, dryRun: true, resolved: true, target: { kind: 'worker', cwd, lane }, note: '只解析目标，未派活' }
       }
-      const task = await enqueue(args.instruction, undefined, classified.target, args.model, 'task', classified.deliver, classified.notes, origin.originThreadId)
+      // 投递控制（第四轮首次验收修正 F）：原生入口同样要能新建 steer——把 steering 传给同一条派发路径
+      // （因此**天然复用**同一套父校验与内部控制凭据语义：这个入口在宿主进程内，不经过 HTTP，
+      //  但它绝不放宽校验——缺父/父已结束/错来源一律零投递拒绝）。
+      const isSteer = classified.deliver === 'steer' || typeof args.parentTaskId === 'string'
+      if (isSteer && args.deliver !== 'steer') return { ok: false, reason: REASONS.PARENT_REQUIRED, error: 'parentTaskId 只在 deliver="steer" 时有效' }
+      if (isSteer && (typeof args.parentTaskId !== 'string' || args.parentTaskId.trim() === '')) {
+        return { ok: false, reason: REASONS.PARENT_REQUIRED, error: 'steer 必须显式给 parentTaskId（绝不按"最近/最老任务"推断）' }
+      }
+      // 第二次验收修正 1：原生入口的 steer **同样 fail-closed**——本机没有可信控制 key（或缺/坏）时零派活。
+      // 普通非委托 queue 不增加凭据前提（与 HTTP 契约一致）。
+      if (isSteer) {
+        const auth = nativeControlAuth()
+        if (auth.ok !== true) {
+          return {
+            ok: false,
+            reason: auth.reason,
+            error: auth.reason === APPROVAL_REASONS.NO_KEY
+              ? 'steer 改动既有任务：原生入口需要本机可信控制 key（先运行 --approval-key-init）。缺 key 零派活——本工具**不接受**调用方传入的 raw key。'
+              : 'steer 的控制 key 校验失败（格式非法）：零派活。',
+            resend: false,
+          }
+        }
+      }
+      const steering = isSteer
+        ? { parentTaskId: args.parentTaskId.trim(), expectedTurn: Number.isInteger(args.expectedTurn) ? args.expectedTurn : undefined }
+        : undefined
+      const routePolicy = parseRoutePolicy(args)
+      const task = await enqueue(args.instruction, undefined, classified.target, args.model, 'task', classified.deliver, classified.notes, origin.originThreadId, undefined, steering, routePolicy)
       if (task.status === 'error') {
         return { ok: false, taskId: task.taskId, reason: task.reason, error: task.error, ...(task.delivered === true ? { delivered: true } : {}), ...(task.candidates === undefined ? {} : { candidates: task.candidates }) }
       }
@@ -1806,8 +3542,29 @@ export async function apply(ctx) {
       if (args.wait !== true || timer === undefined) {
         return brief
       }
+      // 回执（F/C）：只等**回执自身**的终态（observed/deviated/unconfirmed/pending），绝不等父任务结果。
+      if (isSteer) {
+        const t0 = Date.now()
+        while (task.receiptState === 'accepted' || task.receiptState === 'pending') {
+          if (Date.now() - t0 > 30000) break
+          await timer.timeout(500)
+        }
+        return {
+          ...brief,
+          status: task.status,
+          receiptState: task.receiptState,
+          resultScope: 'parent-task',
+          ...(task.observedTurn === undefined ? {} : { observedTurn: task.observedTurn }),
+          resend: false,
+          phase: task.receiptState === 'observed' ? 'receipt-observed'
+            : (task.receiptState === 'deviated' ? 'receipt-deviated'
+              : (task.receiptState === 'unconfirmed' ? 'receipt-unconfirmed' : 'receipt-pending')),
+          hint: '这是补充回执（resultScope=parent-task），不代表父任务结果；父任务结果请查父 taskId 的状态；未观察到时不要重发。',
+        }
+      }
+      // 队列语义（F）：queued 也是"在途"，等待时要一直等到真正的终态（或超时）。
       const t0 = Date.now()
-      while (task.status === 'accepted' || task.status === 'running') {
+      while (task.status === 'accepted' || task.status === 'queued' || task.status === 'running') {
         if (Date.now() - t0 > 900000) return { ...brief, status: task.status, result: task.result, note: 'wait 超时' }
         await timer.timeout(2500)
       }
@@ -1846,9 +3603,11 @@ export async function apply(ctx) {
     for (const s of sockets) { try { s.destroy() } catch (e) {} }
     sockets.clear()
     for (const bucket of buckets.values()) {
+      bucket.observationAbort?.abort()
       if (bucket.handle !== null) { void bucket.handle.dispose() }
     }
     for (const bucket of reviewerBuckets.values()) {
+      bucket.observationAbort?.abort()
       if (bucket.handle !== null) { void bucket.handle.dispose() }
     }
     for (const record of sessionTargets.values()) {

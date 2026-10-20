@@ -19,14 +19,16 @@ export const rememberTask = (tasks, task, limit = DEFAULT_TASK_LIMIT) => {
   tasks.push(task)
   const bound = typeof limit === 'number' && limit > 0 ? limit : DEFAULT_TASK_LIMIT
   while (tasks.length > bound) {
-    // 只淘汰终态（非 accepted/running）且不是刚加进来的那一条。
-    const index = tasks.findIndex((t) => t !== task && t.status !== 'accepted' && t.status !== 'running')
+    // 淘汰**终态**（非 active）且不是刚加进来的那一条。
+    // active 含 accepted / running / needs-approval（等待审批的活任务不能被淘汰，
+    // 否则完成回调、会话观察器与审批 pending 都会失去归属）。
+    const index = tasks.findIndex((t) => t !== task && !isActiveTask(t))
     if (index === -1) break                    // 全是活任务：宁可超过上限，也不丢执行中的任务
     tasks.splice(index, 1)
   }
   return tasks
 }
 
-/** 是否处于"还在执行"的状态（完成回调需要能找到它）。 */
+/** 是否处于"还在执行/等待中"的状态（完成回调与审批归属需要能找到它）。 */
 export const isActiveTask = (task) => task !== null && typeof task === 'object'
-  && (task.status === 'accepted' || task.status === 'running')
+  && (task.status === 'accepted' || task.status === 'running' || task.status === 'needs-approval' || task.awaitingOfficialEnd === true)

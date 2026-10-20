@@ -29,6 +29,33 @@ export const REASONS = {
   DISPATCH_FAILED: 'session-dispatch-failed',
   /** 带来源的会话任务不能精确关联到单个请求回合：在执行前拒绝 steer。 */
   ORIGIN_STEER_UNSUPPORTED: 'origin-steer-unsupported',
+  // ---- 投递控制（queue / steer）的稳定失败码 ----
+  /** steer 必须显式给出父任务（不允许按"最近/最老任务"推断）。 */
+  PARENT_REQUIRED: 'steer-parent-required',
+  /** 给的父任务不存在、不属于同一来源/会话/档案，或不是真实在执行的队列任务。 */
+  PARENT_INVALID: 'steer-parent-invalid',
+  /** 父任务已终态（不可能再插入）。 */
+  PARENT_TERMINAL: 'steer-parent-terminal',
+  /** 父任务还在排队（还没真正开始执行）——插入没有意义，执行前拒绝。 */
+  PARENT_QUEUED: 'steer-parent-queued',
+  /** 给了 expectedTurn 但与父任务当前真实 turn 不一致。 */
+  PARENT_TURN_MISMATCH: 'steer-turn-mismatch',
+  /** 无来源的 steer 会改动别人的在途任务：零投递拒绝。 */
+  ORIGIN_REQUIRED_FOR_STEER: 'steer-origin-required',
+  /** 旧无来源（不可精确关联）任务与新的来源绑定任务混在同一会话：拒绝这种不安全组合。 */
+  LEGACY_MIX_UNSAFE: 'legacy-mix-unsafe',
+  /** 回执已接收但没能观察到自己的 rpcId 落进父回合（不重发、不猜）。 */
+  RECEIPT_UNCONFIRMED: 'steer-receipt-unconfirmed',
+  /** 回执落进了**另一个**回合（官方异步 admission / wakingAfterAbort 改道）：如实报告偏离，绝不假成功。 */
+  RECEIPT_TURN_DEVIATED: 'steer-turn-deviated',
+  /** steer 预检时父任务的回合已经结束（官方日志证据）：执行前拒绝。 */
+  PARENT_TURN_CLOSED: 'steer-parent-turn-closed',
+  /** 模型路由：精确指定的 pair/model 不在已配置目录内，或同名跨 provider 歧义 → 派活前拒绝（不静默选错）。 */
+  MODEL_ROUTE_INVALID: 'model-route-invalid',
+  /** 模型路由已按"本任务"终态收口（候选耗尽/禁 fallback 终止等）：稳定 reason，客户端不重发、不冒充成功。 */
+  MODEL_ROUTE_EXHAUSTED: 'model-route-exhausted',
+  /** 子代理回合以失败 stopReason 结束（error/aborted/refusal/max-tokens…）：绝不 done。 */
+  SUBAGENT_TURN_FAILED: 'subagent-turn-failed',
   /** 关联到了请求回合，但该回合以非 completed 结束（aborted/blocked/error/…）。 */
   TURN_FAILED: 'session-turn-failed',
   /** 没有任何证据能确认这个请求回合的结局（不猜、不重发）。 */
@@ -117,7 +144,8 @@ export const pickSessionResult = (streamed, extracted) => {
  * 同一套规则被 live follow 帧、follow 开场 snapshot.records、以及轮询读日志共用；`seq` 去重保证
  * 同一条事件被多条路径投递时也只算一次、不串文本。
  */
-export const createRequestTracker = (requestId) => ({
+export const createRequestTracker = (requestId, floorSeq) => ({
+  floorSeq,
   requestId: String(requestId),
   /** 已 turn/start 但未 turn/end 的 turn 号（有序）。 */
   openTurns: [],
@@ -131,6 +159,13 @@ export const createRequestTracker = (requestId) => ({
    * （否则快照缺前半段就会永久丢掉答案）。
    */
   usedSeqs: new Set(),
+  /**
+   * 绑定到自己的 turn **之前**看到的助手文本（seq 升序回填）。
+   * 不能丢（快照缺前半段时会永久丢答案），也不能在回读时按"到达顺序"追加（会倒序/重复）。
+   */
+  deferred: [],
+  /** 本请求的 user/message 所在 seq（回填助手文本的下界；未见到时保持 undefined）。 */
+  requestSeq: undefined,
   end: undefined,
   lastSeq: 0,
 })
@@ -138,10 +173,93 @@ export const createRequestTracker = (requestId) => ({
 const dataOf = (event) => (event.data !== undefined && event.data !== null && typeof event.data === 'object' ? event.data : {})
 
 /**
+ * **官方日志的 fresh 证据**（第四轮 B/C/E）：只读事件序列，不看任何缓存状态。
+ *  - `openTurns(events)`：按出现顺序列出仍未结束的 turn（turn/start 入、对应 turn/end 出）。
+ *  - `currentOpenTurn(events)`：最后一个仍未结束的 turn（= 真实"当前开放回合"），没有则 null。
+ *  - `turnHasEnded(events, turn)`：该 turn 是否已经收到 turn/end。
+ *  - `findRequestEvidence(events, requestId)`：该 rpcId 的 user/message 落在哪个 turn（含 seq）。
+ */
+export const openTurnsOf = (events) => {
+  const open = []
+  if (!Array.isArray(events)) return open
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    const data = dataOf(event)
+    const turn = typeof data.turn === 'number' ? data.turn : undefined
+    if (event.type === 'turn/start' && turn !== undefined) { if (!open.includes(turn)) open.push(turn); continue }
+    if (event.type === 'turn/end' && turn !== undefined) {
+      const index = open.indexOf(turn)
+      if (index >= 0) open.splice(index, 1)
+    }
+  }
+  return open
+}
+
+export const currentOpenTurn = (events) => {
+  const open = openTurnsOf(events)
+  return open.length === 0 ? null : open[open.length - 1]
+}
+
+export const turnHasEnded = (events, turn) => {
+  if (!Array.isArray(events) || !Number.isInteger(turn)) return false
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    const data = dataOf(event)
+    if (event.type === 'turn/end' && data.turn === turn) return true
+  }
+  return false
+}
+
+/** 该 rpcId 的 user/message 在日志里的位置：`{seq, turn}`（turn = 它所在的那个开放回合；不明则 null）。 */
+export const findRequestEvidence = (events, requestId) => {
+  if (!Array.isArray(events) || typeof requestId !== 'string' || requestId === '') return null
+  const open = []
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    const data = dataOf(event)
+    const turn = typeof data.turn === 'number' ? data.turn : undefined
+    if (event.type === 'turn/start' && turn !== undefined) { if (!open.includes(turn)) open.push(turn); continue }
+    if (event.type === 'turn/end' && turn !== undefined) {
+      const index = open.indexOf(turn)
+      if (index >= 0) open.splice(index, 1)
+      continue
+    }
+    if (event.type !== 'user/message') continue
+    const source = data.source !== undefined && data.source !== null && typeof data.source === 'object' ? data.source : {}
+    if (source.rpcId !== requestId) continue
+    const enclosing = typeof data.turn === 'number' ? data.turn : (open.length > 0 ? open[open.length - 1] : null)
+    return { seq: typeof event.seq === 'number' ? event.seq : undefined, turn: enclosing }
+  }
+  return null
+}
+
+/**
+ * 一次性把"绑定前"的助手文本按 seq 升序补进 `text`（第四轮修正 E/D）：
+ *  - **批内/跨回放去重**：已经用过的 seq 绝不重复追加（同一缺前快照喂两遍不能变成 OWNOWN）；
+ *  - **按 turn 过滤**：明确属于别的 turn 的文本丢弃（不能把另一个回合的 FOREIGN 记到自己头上）；
+ *  - **只在"自己的 user/message 之后"**（requestSeq 下界），否则同 turn 里更早请求的文本会张冠李戴。
+ * 不能用"把所有未知 turn 事件一律提前标记 used"来简化——那会破坏缺前半段快照的合法回填。
+ */
+const flushDeferred = (tracker) => {
+  if (!Array.isArray(tracker.deferred) || tracker.deferred.length === 0) return
+  const pending = tracker.deferred.slice().sort((a, b) => a.seq - b.seq)
+  tracker.deferred = []
+  const requestSeq = Number.isInteger(tracker.requestSeq) ? tracker.requestSeq : -1
+  for (const item of pending) {
+    if (tracker.usedSeqs.has(item.seq)) continue                  // 批内/跨回放去重
+    tracker.usedSeqs.add(item.seq)
+    if (item.turn !== undefined && item.turn !== tracker.turn) continue   // 明确属于别的回合 → 丢弃
+    if (item.seq < requestSeq) continue                           // 请求之前的文本不属于本请求
+    tracker.text += item.text
+  }
+}
+
+/**
  * 消费一条会话事件。返回 `'settled'`（本请求的 turn 已结束）/ `'progress'` / `'ignored'`。
  */
 export const consumeSessionEvent = (tracker, event) => {
   if (tracker === undefined || tracker === null) return 'ignored'
+  if (Number.isInteger(tracker.floorSeq) && Number.isInteger(event?.seq) && event.seq <= tracker.floorSeq) return 'ignored'
   if (event === null || typeof event !== 'object') return 'ignored'
   const seq = typeof event.seq === 'number' ? event.seq : undefined
   if (seq !== undefined) {
@@ -160,20 +278,36 @@ export const consumeSessionEvent = (tracker, event) => {
     const source = data.source !== undefined && data.source !== null && typeof data.source === 'object' ? data.source : {}
     if (typeof source.rpcId !== 'string' || source.rpcId !== tracker.requestId) return 'ignored'
     tracker.sawRequest = true
+    if (seq !== undefined && !Number.isInteger(tracker.requestSeq)) tracker.requestSeq = seq   // 本请求消息所在的 seq（回填下界）
     if (tracker.turn === undefined) {
       // user/message 没有 data.turn：归到此刻仍未闭合的那个 turn（有 data.turn 时以它为准）
       const fallback = tracker.openTurns.length > 0 ? tracker.openTurns[tracker.openTurns.length - 1] : undefined
       tracker.turn = typeof data.turn === 'number' ? data.turn : fallback
     }
     // 只有真的建立了 turn 关联才算"用过"；没有未闭合 turn 时留待回填。
-    if (tracker.turn !== undefined) markUsed()
+    if (tracker.turn !== undefined) {
+      markUsed()
+      flushDeferred(tracker)                                // 按 seq 顺序补上"绑定前"的助手文本（且只补一次）
+    }
     return 'progress'
   }
   if (event.type === 'assistant/message') {
-    if (tracker.turn === undefined) return 'ignored'         // 还不知道自己的 turn：留待回填
-    if (typeof data.turn === 'number' && data.turn !== tracker.turn) return 'ignored'
     const text = assistantTextOf(event)
     if (text === '') return 'ignored'
+    if (tracker.turn === undefined) {
+      // 还不知道自己的 turn：**排队等待按 seq 顺序回填**（不能直接丢，也不能在回读时才追加——
+      // 那会把更早的文本接到更晚的文本后面，root 复现过 AFTER → AFTER|BEFORE 的倒序）。
+      // 同时记下事件自带的 turn（若官方给了），回填时据此丢弃别的回合的文本；同一 seq 只入队一次
+      // （同一"缺前快照"喂两遍不得变成 OWNOWN）。
+      if (seq !== undefined && !tracker.deferred.some((item) => item.seq === seq)) {
+        tracker.deferred.push({ seq, turn: typeof data.turn === 'number' ? data.turn : undefined, text })
+      }
+      return 'ignored'
+    }
+    if (typeof data.turn === 'number' && data.turn !== tracker.turn) {
+      markUsed()                                            // 明确不是我们的 turn：用掉，避免反复评估
+      return 'ignored'
+    }
     tracker.text += text
     markUsed()
     return 'progress'
@@ -262,8 +396,10 @@ export const classifyTarget = (input) => {
     if (id === undefined && query === undefined) {
       return { ok: false, reason: REASONS.INVALID_TARGET, message: 'session target needs sessionId or query' }
     }
-    // session 语义自带工作目录与模型：混用会让人以为还能控制它们。
-    for (const [field, value] of [['cwd', raw.cwd], ['lane', raw.lane], ['model', raw.model]]) {
+    // session 语义自带工作目录：混用会让人以为还能控制它。
+    // **模型例外**（第五轮模型路由契约）：session 目标**接受** model/provider/modelFallback——扁平写法
+    // （sessionId+model）与 target.kind='session'+model 必须语义一致，两者都由任务级路由策略处理。
+    for (const [field, value] of [['cwd', raw.cwd], ['lane', raw.lane]]) {
       if (nonEmpty(value)) {
         return { ok: false, reason: REASONS.INVALID_TARGET, message: `${field} is not accepted with a session target` }
       }
@@ -415,6 +551,8 @@ export const rankTitleCandidates = (query, summaries, limit = 5) => {
 /** 任务在 HTTP 行上的回显：调用方一眼能看出这次是"新建"还是"接进哪个会话"。 */
 export const taskResponse = (task) => {
   const out = { taskId: task.taskId, status: task.status, kind: task.kind }
+  // 动态模型路由（M2）：回显实际选择/模式/是否允许降级（非秘密；不含任何凭据）。
+  if (task.route !== undefined && task.route !== null && typeof task.route === 'object') out.route = task.route
   const target = task.target !== undefined && task.target !== null
     ? task.target
     // 兼容 0.1.1 之前落下的记录（如 review 任务）：没有 target 字段时按 worker 回显。
@@ -433,5 +571,22 @@ export const taskResponse = (task) => {
   }
   // 来源关联（R1）：回显发起这次任务的 Codex 对话 id，便于跨回合按 origin+taskId 精确收取。
   if (typeof task.originThreadId === 'string' && task.originThreadId !== '') out.originThreadId = task.originThreadId
+  // 委托审批的**非秘密**定位/期限（第三轮修正）：客户端等待循环必须能凭它做认证续租，
+  // 否则慢模型超过初始租约就会把首个 ask 交回人工。raw key/摘要一律不出现在这里。
+  if (typeof task.grantId === 'string' && task.grantId !== '') {
+    out.grantId = task.grantId
+    if (Number.isFinite(task.grantExpiresAt)) out.grantExpiresAt = task.grantExpiresAt
+    if (Number.isFinite(task.grantLeaseUntil)) out.grantLeaseUntil = task.grantLeaseUntil
+  }
+  // 投递控制（第四轮）：回显投递模式与父/回执关系（非秘密），让调用方能区分"排队任务"与"补充回执"。
+  if (task.target !== undefined && task.target !== null && task.target.kind === 'session') {
+    const mode = task.requestedMode !== undefined ? task.requestedMode : task.deliver
+    if (mode !== undefined) out.deliver = mode
+    if (typeof task.parentTaskId === 'string' && task.parentTaskId !== '') out.parentTaskId = task.parentTaskId
+    if (typeof task.receiptState === 'string' && task.receiptState !== '') out.receiptState = task.receiptState
+    if (Number.isInteger(task.observedTurn)) out.observedTurn = task.observedTurn
+    if (Number.isInteger(task.expectedTurn)) out.expectedTurn = task.expectedTurn
+    if (typeof task.resultScope === 'string' && task.resultScope !== '') out.resultScope = task.resultScope
+  }
   return out
 }

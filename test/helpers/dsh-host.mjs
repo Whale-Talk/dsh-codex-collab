@@ -62,7 +62,8 @@ const loadBridge = async () => {
 export const tick = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
- * fetch/undici 按规范**禁用**的端口（"bad port"）。
+ * fetch/undici 按规范**禁用**的端口（"bad port"）——集合里含 4190 与 6679：这两个是在本机
+ * Node 24.16 的 badPorts 里补上的缺项（root 的 verify-fetch-port-fixture 确认覆盖 82 个 badPorts）。
  * 测试网关若恰好被系统分配到这些端口，`fetch` 会直接拒绝连接（TypeError: fetch failed / bad port）——
  * 表现为"网关已 ready 但请求失败、且没有任何 bridge 日志"的诡异失败。这里主动避开。
  */
@@ -70,11 +71,11 @@ const BLOCKED_PORTS = new Set([
   1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103, 104,
   109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
   526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049,
-  3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+  3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
 ])
 
 /** 监听一个**非禁用**的临时端口（拿到禁用端口就关掉重听）。 */
-const listenOnUsablePort = async (server) => {
+export const listenOnUsablePort = async (server) => {
   for (let attempt = 0; attempt < 20; attempt++) {
     await new Promise((resolve, reject) => {
       const onError = (e) => { server.removeListener('listening', onListening); reject(e) }
@@ -97,11 +98,15 @@ const listenOnUsablePort = async (server) => {
 export const startGateway = async (options) => {
   const { apply } = await loadBridge()
   const handlers = new Map()
+  // kind:'prefix' 路由（与真实 webServer 同款语义：先精确命中，再按注册序前缀命中；
+  // 真实生产里 bridge 的 /api/dsh-bridge/* 精确路由也必须能盖过 client-connection 的 /api 前缀）。
+  const prefixRoutes = []
   const starts = []
   const prompts = []
   const owners = []
   const followups = []
   const routeErrors = []
+  const registeredTools = []
   const cleanups = []
   const ctxHandlers = new Map()
   const agentHandlers = new Map()
@@ -127,14 +132,18 @@ export const startGateway = async (options) => {
     async resolveAgent(sessionId) { return { sessionId } },
     async prompt(args) { prompts.push(args); return {} },
     // options.follow 用于注入 follow 帧（含开场 snapshot）；options.events 是"读日志"能看到的事件。
-    async *follow() { if (options.follow) yield* options.follow() },
+    async *follow(request, signal) { if (options.follow) yield* options.follow(request, signal) },
     async cancel() { return {} },
   }
   /** 假 timer：把 interval 回调收起来，测试可显式触发一次 sweep（真实 profile 由 timer 服务按 2.5s 跑）。 */
   const intervals = []
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1')
-    const handler = handlers.get(url.pathname)
+    let handler = handlers.get(url.pathname)
+    if (handler === undefined) {
+      const prefix = prefixRoutes.find((route) => url.pathname === route.path || url.pathname.startsWith(route.path + '/'))
+      handler = prefix === undefined ? undefined : prefix.handler
+    }
     if (handler === undefined) { res.writeHead(404); res.end('not found'); return }
     Promise.resolve()
       .then(() => handler(req, res))
@@ -149,7 +158,17 @@ export const startGateway = async (options) => {
 
   const ctx = {
     webServer: {
-      register(route) { handlers.set(route.path, route.handler); return () => handlers.delete(route.path) },
+      register(route) {
+        if (route.kind === 'prefix') {
+          prefixRoutes.push(route)
+          return () => {
+            const index = prefixRoutes.indexOf(route)
+            if (index !== -1) prefixRoutes.splice(index, 1)
+          }
+        }
+        handlers.set(route.path, route.handler)
+        return () => handlers.delete(route.path)
+      },
       registerUpgrade() { return () => {} },
     },
     agents: {
@@ -170,13 +189,23 @@ export const startGateway = async (options) => {
         return { childId }
       },
       async followup(args) { followups.push(args); return {} },
+      // 模型路由（第五轮）：官方继续入口是 `subagents.prompt(continuable)`（官方包里没有 followup）；
+      // 这个 mock 让 worker 的第二条任务走真实生产调用路径，而不是在测试里报 "undefined is not a function"。
+      async prompt(args) { followups.push(args); prompts.push(args); return { messageId: 'msg-' + followups.length } },
+      /** 官方 owner 关系（worker claim 的 expectedOwner 核验走它；默认都算属于登记的 owner）。 */
+      isOwnedBy() { return true },
       interrupt() {},
+      ...(options.subagents || {}),
     },
-    tools: { register() { return () => {} } },
+    tools: { register(tool) { registeredTools.push(tool); return () => {} } },
     get(name) {
       if (name === 'sessionController') return controller
-      if (name === 'sessionQuery') return { async readSession() { return { events: options.events || [] } } }
-      if (name === 'timer') return { interval: (fn) => { intervals.push(fn); return () => {} } }
+      if (name === 'sessionQuery') return options.sessionQuery || { async readSession() { return { events: options.events || [] } } }
+      if (name === 'sessions') return options.sessions
+      if (name === 'timer') return { interval: (fn) => { intervals.push(fn); return () => {} }, timeout: (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(ms, 50)))) }
+      // 模型路由（M2）：只有显式给了替身时才暴露（默认 undefined = 目录不可用，如实上报）
+      if (name === 'llm') return options.llm
+      if (name === 'agents') return options.agents
       return undefined
     },
     on: onCtx,
@@ -237,13 +266,28 @@ export const startGateway = async (options) => {
       }
       return false
     },
+    /** 触发某个 ctx 事件；返回每个监听器的返回值数组（approval/request 答复者是 Promise，需要拿到它来断言）。 */
     emitCtx(name, ...args) {
-      for (const fn of ctxHandlers.get(name) || []) fn(...args)
+      const results = []
+      for (const fn of ctxHandlers.get(name) || []) results.push(fn(...args))
+      return results
     },
     /** 显式触发一次 2.5s sweep（含会话轮询/超时兜底），并等回调里的异步收尾跑完。 */
     async runIntervals(settleMs = 60) {
       for (const fn of intervals) fn()
       await new Promise((resolve) => setTimeout(resolve, settleMs))
+    },
+    /** 已注册的原生工具（第四轮首次验收修正 F：要真正走一次工具的 execute 接线，不能只测 HTTP）。 */
+    tools: registeredTools,
+    /**
+     * 调用一个**真实注册**的原生工具（走它的完整 execute，与宿主调用同一入口）。
+     * 未注册 → 明确抛错，绝不静默当成"通过"。
+     */
+    async callTool(name, args) {
+      const tool = registeredTools.find((t) => t !== null && typeof t === 'object' && t.name === name)
+      if (tool === undefined) throw new Error('native tool not registered: ' + name)
+      if (typeof tool.execute !== 'function') throw new Error('native tool has no execute(): ' + name)
+      return tool.execute(args)
     },
     async close() {
       for (const cleanup of cleanups) { try { cleanup() } catch (e) { /* ignore */ } }

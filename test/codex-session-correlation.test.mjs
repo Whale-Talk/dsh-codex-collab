@@ -192,14 +192,14 @@ test('精确关联：follow 开场 snapshot.records 里的已完成请求必须�
       yield {
         type: 'snapshot',
         header: { version: 1, id: 'sess-snapshot', createdAt: 1, isSeeded: false },
-        cursor: 4,
+        cursor: 3,
         hasMore: false,
-        projections: { asOfSeq: 4, values: {} },
+        projections: { asOfSeq: 3, values: {} },
         records: [
-          ev(1, 'turn/start', { turn: 1 }),
-          ev(2, 'user/message', { id: 'snapshot-user', role: 'user', source: { rpcId: taskId } }),
-          ev(3, 'assistant/message', { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'SNAPSHOT RESULT' }] } }),
-          ev(4, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+          ev(0, 'turn/start', { turn: 1 }),
+          ev(1, 'user/message', { id: 'snapshot-user', role: 'user', source: { rpcId: taskId } }),
+          ev(2, 'assistant/message', { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'SNAPSHOT RESULT' }] } }),
+          ev(3, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
         ].map((event) => ({ type: 'event', event })),
       }
     },
@@ -218,12 +218,7 @@ test('精确关联：follow 开场 snapshot.records 里的已完成请求必须�
 
 test('精确关联：同一条事件被 snapshot 与日志重复投递时不串文本、不重复计字', async () => {
   const assocRoot = await makeTmp('dsh-sess-d-')
-  const events = [
-    ev(1, 'turn/start', { turn: 3 }),
-    ev(2, 'user/message', { id: 'dup-user', role: 'user', source: { rpcId: 'PLACEHOLDER' } }),
-    ev(3, 'assistant/message', { turn: 3, step: 1, message: { content: [{ type: 'text', text: 'ONLY-ONCE' }] } }),
-    ev(4, 'turn/end', { turn: 3, reason: { kind: 'completed' } }),
-  ]
+  const events = []
   let taskId
   const gateway = await startGateway({
     assocRoot,
@@ -233,7 +228,7 @@ test('精确关联：同一条事件被 snapshot 与日志重复投递时不串�
       // 先投一遍 snapshot（含整轮），之后读日志还会再看到同样 seq 的事件
       yield {
         type: 'snapshot',
-        cursor: 4,
+        cursor: 3,
         hasMore: false,
         records: events.map((event) => ({ type: 'event', event: { ...event, data: event.type === 'user/message' ? { ...event.data, source: { rpcId: taskId } } : event.data } })),
       }
@@ -244,7 +239,13 @@ test('精确关联：同一条事件被 snapshot 与日志重复投递时不串�
     const submitted = await postJson(gateway.url + '/api/dsh-bridge/task', { instruction: 'dup', sessionId: 'sess-dup', deliver: 'queue', originThreadId: 'source-A' })
     expectDispatched(submitted, gateway, '派发(submitted)')
     taskId = submitted.body.taskId
-    events[1].data.source.rpcId = taskId
+    // Official events are append-only: publish this request after dispatch, then replay the same seqs.
+    events.push(
+      ev(0, 'turn/start', { turn: 3 }),
+      ev(1, 'user/message', { id: 'dup-user', role: 'user', source: { rpcId: taskId } }),
+      ev(2, 'assistant/message', { turn: 3, step: 1, message: { content: [{ type: 'text', text: 'ONLY-ONCE' }] } }),
+      ev(3, 'turn/end', { turn: 3, reason: { kind: 'completed' } }),
+    )
     const result = await waitForStatus(statusUrl(gateway.url, taskId, 'source-A'), (body) => body !== null && body.status === 'done')
     assert.equal(result.body.status, 'done')
     assert.equal(result.body.result, 'ONLY-ONCE', '重复投递不得把文本算两遍')
@@ -296,23 +297,32 @@ test('精确关联：没有匹配 rpcId 就没有完成证据 → 未确认（re
   }
 })
 
-test('精确关联：带来源的会话派发拒绝 steer（执行前拒绝、零 prompt）；无来源的旧路径仍允许', async () => {
+test('精确关联：带来源的 steer 走新父回执契约（缺父/缺凭据=零投递）；无来源的旧路径仍允许', async () => {
   const assocRoot = await makeTmp('dsh-sess-f-')
   const gateway = await startGateway({ assocRoot, env: { DSH_BRIDGE_SESSION_DISPATCH_TIMEOUT_MS: 300 } })
   const url = gateway.url + '/api/dsh-bridge/task'
   try {
     const steer = await postJson(url, { instruction: 'steer-with-origin', sessionId: 'sess-steer', deliver: 'steer', originThreadId: 'source-A' })
-    // 这一路期望的是**被拒绝**（不是派发成功）
-    assert.notEqual(steer.status, 202, '带来源的 steer 必须被拒绝: ' + dispatchDiag(steer, gateway))
-    assert.equal(steer.body.reason, 'origin-steer-unsupported')
+    // 这一路期望的是**被拒绝**（不是派发成功）：steer 是"改动既有任务"的动作 →
+    // 必须带控制凭据，且必须显式给父任务（第四轮父回执契约，取代旧的 origin-steer-unsupported）。
+    assert.notEqual(steer.status, 202, '带来源但缺父/缺凭据的 steer 必须被拒绝: ' + dispatchDiag(steer, gateway))
+    assert.equal(
+      ['steer-parent-required', 'approval-control-invalid', 'approval-key-missing', 'steer-origin-required'].includes(steer.body.reason),
+      true,
+      '必须是明确的零投递拒绝原因: ' + JSON.stringify(steer.body),
+    )
     assert.equal(gateway.prompts.length, 0, '拒绝必须发生在 prompt 之前')
 
-    // 旧的无来源 steer 行为保留
-    const legacy = await postJson(url, { instruction: 'legacy steer', sessionId: 'sess-steer-legacy', deliver: 'steer' })
-    expectDispatched(legacy, gateway, '派发(legacy)')
-    assert.equal(legacy.status, 202)
+    // 无来源的 steer 同样被拒（它可能改动别人的在途任务）：第四轮起 steer 一律需要凭据 + 显式父任务。
+    const legacySteer = await postJson(url, { instruction: 'legacy steer', sessionId: 'sess-steer-legacy', deliver: 'steer' })
+    assert.notEqual(legacySteer.status, 202, '无来源 steer 必须零投递: ' + JSON.stringify(legacySteer.body))
+    assert.equal(gateway.prompts.length, 0, '仍不得发出 steer')
+    // 但**旧非委托 queue 不增加凭据前提**（投递控制只收紧 steer，不收紧旧队列路径）
+    const legacyQueue = await postJson(url, { instruction: 'legacy queue', sessionId: 'sess-queue-legacy', deliver: 'queue' })
+    expectDispatched(legacyQueue, gateway, '派发(legacy queue)')
+    assert.equal(legacyQueue.status, 202)
     assert.equal(gateway.prompts.length, 1)
-    assert.equal(gateway.prompts[0].mode, 'steer')
+    assert.equal(gateway.prompts[0].mode, 'queue')
   } finally {
     await gateway.close()
   }

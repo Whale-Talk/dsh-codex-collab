@@ -146,12 +146,20 @@ test('classifyTarget: session 目标必须恰好给一个定位方式', () => {
   assert.equal(classifyTarget({ target: { kind: 'nope' } }).reason, REASONS.INVALID_TARGET)
 })
 
-test('classifyTarget: session 目标不许混 cwd/lane/model/commit', () => {
-  for (const extra of [{ cwd: 'E:\\x' }, { lane: 'main' }, { model: 'fast' }, { commit: true }]) {
+test('classifyTarget: session 目标不许混 cwd/lane/commit，但**接受 model**（第五轮模型路由契约）', () => {
+  for (const extra of [{ cwd: 'E:\\x' }, { lane: 'main' }, { commit: true }]) {
     const r = classifyTarget({ target: { kind: 'session', sessionId: 's' }, ...extra })
     assert.equal(r.ok, false, JSON.stringify(extra))
     assert.equal(r.reason, REASONS.INVALID_TARGET)
   }
+  // model 不再被拒：扁平写法与 target.kind='session' 写法必须语义一致（都由任务级路由策略处理）
+  const explicit = classifyTarget({ target: { kind: 'session', sessionId: 's' }, model: 'auto' })
+  assert.equal(explicit.ok, true, 'session + model 必须被接受: ' + JSON.stringify(explicit))
+  assert.equal(explicit.target.kind, 'session')
+  const flat = classifyTarget({ sessionId: 's', model: 'auto' })
+  assert.equal(flat.ok, true, '扁平 sessionId + model 必须同样被接受')
+  assert.equal(flat.target.kind, 'session')
+  assert.equal(flat.deliver, explicit.deliver, '两种书写方式的投递模式必须一致')
 })
 
 test('classifyTarget: deliver 只认 queue/steer', () => {

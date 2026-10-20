@@ -174,6 +174,12 @@ const makeHarness = async (options = {}) => {
         followups.push(args)
         return {}
       },
+      /** 模型路由（第五轮）：官方继续入口是 `subagents.prompt(continuable)`（官方包里没有 followup）。 */
+      async prompt(args) {
+        followups.push(args)
+        prompts.push(args)
+        return { messageId: 'msg-' + followups.length }
+      },
       interrupt() {},
     },
     tools: {
@@ -244,25 +250,37 @@ test('POST /task: default worker dispatch starts a continuable subagent', async 
 })
 
 test('POST /task: session dispatch preserves queue and steer delivery modes', async () => {
-  for (const mode of ['queue', 'steer']) {
+  // queue（无来源 legacy 路径）：行为完全不变
+  {
     const harness = await makeHarness()
     const task = harness.routes.get('/api/dsh-bridge/task')
-
     const res = await callJson(task, {
       instruction: '投递到已有会话',
-      target: { kind: 'session', sessionId: 'session-' + mode },
-      deliver: mode,
+      target: { kind: 'session', sessionId: 'session-queue' },
+      deliver: 'queue',
     })
-
     assert.equal(res.statusCode, 202)
     assert.equal(res.body.target.kind, 'session')
-    assert.equal(res.body.target.deliver, mode)
+    assert.equal(res.body.target.deliver, 'queue')
     assert.equal(harness.prompts.length, 1)
-    assert.equal(harness.prompts[0].mode, mode)
-    assert.equal(harness.prompts[0].sessionId, 'session-' + mode)
+    assert.equal(harness.prompts[0].mode, 'queue')
+    assert.equal(harness.prompts[0].sessionId, 'session-queue')
     assert.deepEqual(harness.prompts[0].content, [{ type: 'text', text: '投递到已有会话' }])
     assert.equal(harness.starts.length, 0)
     assert.equal(harness.owners.length, 0)
+  }
+  // steer：第四轮起它是"改动既有任务"的动作 → 必须有控制凭据 + 显式父任务；无凭据时零投递（401）
+  {
+    const harness = await makeHarness()
+    const task = harness.routes.get('/api/dsh-bridge/task')
+    const res = await callJson(task, {
+      instruction: '插进已有会话',
+      target: { kind: 'session', sessionId: 'session-steer' },
+      deliver: 'steer',
+    })
+    assert.equal(res.statusCode, 401, '无凭据的 steer 必须零投递: ' + JSON.stringify(res.body))
+    assert.equal(['approval-control-invalid', 'approval-key-missing'].includes(res.body.reason), true, '必须是凭据类零投递拒绝: ' + JSON.stringify(res.body))
+    assert.equal(harness.prompts.length, 0, '拒绝发生在 prompt 之前')
   }
 })
 
