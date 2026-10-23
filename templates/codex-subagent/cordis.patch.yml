@@ -1,0 +1,11 @@
+# Optional profile override. Install/select @deepseek-ai/dsh-subagent-codex first.
+# Merge into the existing profile array; this is a fragment, not a standalone bundle.
+- id: subagent-codex
+  config:
+    permissionMode: never
+    # Override only after verifying a model with the bundled Codex runtime/account.
+    # model: gpt-6-astra
+
+# Optional: disable the legacy reverse MCP channel if one-shot Codex tasks suffice.
+# - id: codex-mcp
+#   disabled: true

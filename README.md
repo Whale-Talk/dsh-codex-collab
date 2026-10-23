@@ -6,7 +6,7 @@
 
 本项目 fork 自 [FuJackGao/dsh-collab](https://github.com/FuJackGao/dsh-collab)，在上游基础上由 [Whale-Talk](https://github.com/Whale-Talk) 继续维护与扩展。感谢原作者及上游贡献者。
 
-[安装与下载](#安装) · [升级方法](#升级到新版本) · [使用示例](#使用) · [npm 包](https://www.npmjs.com/package/@whaletalk/dsh-codex-collab) · [GitHub 源码](https://github.com/Whale-Talk/dsh-codex-collab)
+[安装与下载](#安装) · [升级方法](#升级到新版本) · [官方 Codex 子代理（可选）](docs/OFFICIAL_CODEX_SUBAGENT.md) · [使用示例](#使用) · [npm 包](https://www.npmjs.com/package/@whaletalk/dsh-codex-collab) · [GitHub 源码](https://github.com/Whale-Talk/dsh-codex-collab)
 
 > **版本说明**：0.1.10 提供审批委托、queue/steer 投递控制、已配置模型自动选择与故障切换，以及大对话增量观察修复。升级时同时更新 DSH 网关和 Codex 侧 MCP/CLI，并重启 DSH 使新模块生效。
 
@@ -290,15 +290,12 @@ dsh-task --in "<继续推进的指令>" --session "session-example-…" --origin
 
 | 含义 | 可行性 |
 |---|---|
-| 让 DSH 调用 Codex（把 Codex 当执行器/评审员） | ✅ 两端原生支持，见下 |
-| 让 DSH 往你**正开着的某条 ChatGPT/Codex 对话**里插一条消息、就地开一轮 | ❌ 做不到 |
+| 让 DSH 调用 Codex（把 Codex 当执行器/评审员） | ✅ 可用内置 MCP，或单独启用官方 Codex 子代理，见下 |
+| 让 DSH 往你**正开着的某条 ChatGPT/Codex 对话**里插一条消息、就地开一轮 | 本插件尚未提供桌面附着与空闲唤醒通道 |
 
-第二种做不到的原因：现有链路是 Codex 主动（它启动 `dsh-mcp` 子进程调工具），而 MCP 是
-**客户端发起**的协议——服务端无法命令客户端开一轮。服务端→客户端只有 `notifications/*`
-（纯通知，不触发回合）、`sampling/createMessage`、`elicitation/create`（取决于客户端是否
-实现，且不等于"在对话里跑工具"）；ChatGPT 侧同样没有公开 API 能向用户会话投消息。
+来源对话 ID 与任务 ID 解决的是**派活结果归属**，不等于附着或唤醒桌面聊天。下述反向后端会启动它们自己的 Codex 会话；官方子代理的完成通知回到 DSH 父会话。当前本机桌面附着的历史探测见下文 M0 记录，不能据此推断所有平台或未来版本的能力。
 
-### 方案 A：反向通道已内置在本包里（推荐）
+### 方案 A：内置 MCP 反向通道
 
 **装本包就同时得到两个方向**——`cordis.patch.yml` 里插了两行：`dsh-bridge`（Codex → DSH 派活）与 `codex-mcp`（DSH → Codex 反向调用）。原理是两端各有一个原生件：
 
@@ -326,7 +323,19 @@ dsh-task --in "<继续推进的指令>" --session "session-example-…" --origin
 - 装完需**重启 profile 进程**；连接失败只是这批工具不出现（日志里有原因）。
 - 排查：若 `codex` 不在 DSH 进程的 PATH 上，把 `command` 换成 `node` + `args: ['<...>/@openai/codex/bin/codex.js', 'mcp-server']`，或直接指向平台 `codex.exe`。
 
-### 方案 B：worker 里直接跑 `codex exec`
+### 方案 B：官方 Codex 子代理（可选，单独安装）
+
+已有网关可以与 `@deepseek-ai/dsh-subagent-codex` 共存。官方包在 DSH 中提供全局工具 **`subagent_codex`**：每次任务新建临时 Codex 线程，完成后回传答案或失败信息，不支持给这次子任务续聊。我们的 Codex → DSH 派活、queue/steer、来源绑定与审批委托继续由网关负责。
+
+官方运行时是**独立可选依赖**，本包不会自动安装它。应选择与当前 DSH 宿主配套的版本；例如宿主为 `0.2.1-rc.2`：
+
+```sh
+dsh plugin --profile desktop add @deepseek-ai/dsh-subagent-codex@0.2.1-rc.2
+```
+
+Codex 侧仍使用我们的 `dsh` 协作插件和 MCP/CLI，无需另装一个同名官方插件。首次使用请按[集成指南](docs/OFFICIAL_CODEX_SUBAGENT.md)检查登录、模型与权限；[配置片段](templates/codex-subagent/cordis.patch.yml)只覆盖官方 provider，不重复注册工具。旧 MCP 通道可保留供持续对话使用，也可显式关闭。
+
+### 方案 C：worker 里直接跑 `codex exec`
 
 ```powershell
 codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
@@ -334,7 +343,7 @@ codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
 
 一次性、零协议改动；代价是每次都是新会话（无跨轮记忆），且需要执行 shell 的权限。
 
-> 注意：插件自带的 `dsh_collab_send` / `dsh_collab_review` 是 **DSH 侧入口**，只回到同一个网关，**不经过 Codex**。要"叫 Codex 干活"用上面 A/B；要"让 Codex 那条对话继续"，只能等 Codex 自己下一轮（`dsh_task --wait` 或 `dsh_task_status`）。
+> 注意：插件自带的 `dsh_collab_send` / `dsh_collab_review` 是 **DSH 侧入口**，只回到同一个网关，**不经过 Codex**。要"叫 Codex 干活"用上面 A/B/C；本包的来源绑定与结果查询不代表能自动唤醒当前 Codex 桌面对话。
 
 ## DSH → Codex 收件箱（桌面自动唤醒：blocked）
 
