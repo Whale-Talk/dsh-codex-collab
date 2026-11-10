@@ -79,6 +79,7 @@ const satisfiesRange = (versionText, range) => {
 
 /** 只读 asar：读一个文本文件（不存在返回 undefined）。 */
 const readAsarText = (pointer) => {
+  if (!hasAsar) return undefined
   const fd = fs.openSync(ASAR, 'r')
   try {
     const pre = Buffer.alloc(16)
