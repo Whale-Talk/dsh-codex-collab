@@ -8,7 +8,7 @@
 
 [安装与下载](#安装) · [升级方法](#升级到新版本) · [官方 Codex 子代理（可选）](docs/OFFICIAL_CODEX_SUBAGENT.md) · [使用示例](#使用) · [npm 包](https://www.npmjs.com/package/@whaletalk/dsh-codex-collab) · [GitHub 源码](https://github.com/Whale-Talk/dsh-codex-collab)
 
-> **版本说明**：0.1.10 提供审批委托、queue/steer 投递控制、已配置模型自动选择与故障切换，以及大对话增量观察修复。升级时同时更新 DSH 网关和 Codex 侧 MCP/CLI，并重启 DSH 使新模块生效。
+> **版本说明**：0.1.12 适配 DSH 0.2.2-rc.1 与 Codex CLI 0.167。DSH 侧把 provider 选择改为显式白名单 `subagent → spawn → fork`，外部 `codex` provider（官方 `dsh-subagent-codex`）不会被误选；Codex 侧改用 0.167 的 `codex plugin marketplace add` / `codex plugin add` / `codex mcp add` 安装流程，不再依赖已被 0.167 移除的 `codex mcp-server`；并给出把桌面端 GUI 端口固定为 3080 的配置，使 Codex 的 MCP 地址长期有效。升级时同时更新 DSH 网关和 Codex 侧插件/MCP/CLI，并重启 DSH 使新模块生效。
 
 **Codex 主导，DeepSeek 执行，Codex 验收。** 一个插件体系，让 ChatGPT（Codex）像项目经理一样把编码任务派给本机 DeepSeek Harness 的编码子代理，实时回传结果，读文件验收，并由独立评审员实际跑通构建/测试后出具评审报告。
 
@@ -65,7 +65,7 @@ flowchart LR
 
 同一会话的任务共享增量观察；健康的同进程事件或 follow 连接不会再每 2.5 秒全量读取历史。启动和断流补缺使用 SDK 的 `observeSession({ projectionMode: "none" })`，及时释放观察租约；旧 SDK 才降级到串行的 `readSession`。后台失败会退避，慢检查不会重叠，空闲 worker 不读取历史。
 
-兼容 DSH 0.2.0 与 0.2.1 的子代理入口。worker 长时间安静时只报告未确认，继续保留该任务的执行占用，收到官方结束后再回填结果；不会把旧结果交给后来派发的任务。
+兼容 DSH 0.2.0 / 0.2.1 / 0.2.2-rc.1 的子代理入口（0.2.2 起审批状态与回合/步进边界改由会话投影提供，契约测试已同步到新接口）。0.1.12 起 provider 选择改为显式白名单 `subagent → spawn → fork`，官方 `dsh-subagent-codex` 注册的外部 `codex` provider 不会被误选（仍可用 `DSH_COLLAB_SUBAGENT_PROVIDER` 覆盖，但外部 provider 会被拒绝）。worker 长时间安静时只报告未确认，继续保留该任务的执行占用，收到官方结束后再回填结果；不会把旧结果交给后来派发的任务。
 
 审批和人工模型选择仍要求新鲜证据。事件缺口、读取失败或缓冲溢出会补缺或返回未确认，不会把缓存当作批准依据。增量回放与慢读缓冲各有 4 MiB 上限，不保留工具结果正文；任务自身的最终回答仍按原有方式返回。
 
@@ -75,12 +75,12 @@ flowchart LR
 
 | 目录 | 内容 | 说明 |
 |---|---|---|
-| `codex-plugin/` | Codex 本地市场插件包 | 标准 marketplace 结构（`.agents/plugins/marketplace.json` + 插件目录），含协作技能 `dsh-collab` |
+| `codex-plugin/` | Codex 本地市场插件包 | 标准 marketplace 结构（`.agents/plugins/marketplace.json` + 插件目录），含协作技能 `dsh-collab`；用 `codex plugin marketplace add` + `codex plugin add` 安装（Codex CLI 0.167 实测） |
 | `mcp/dsh-mcp.mjs` | MCP 服务器（零依赖 Node） | stdio 传输（Codex `[mcp_servers]` 直连）+ Streamable HTTP 传输（`--http`，供 Secure MCP Tunnel / cloudflared 桥接 ChatGPT）；9 个工具：`dsh_task` / `dsh_sessions` / `dsh_task_status` / `dsh_task_cancel` / `dsh_review` / `dsh_read_file` / `dsh_approvals` / `dsh_approval_decide` / `dsh_models` |
 | `harness/dsh-bridge.mjs` | DeepSeek Harness 宿主组合网关插件 | 提供 HTTP 网关（`/api/dsh-bridge/*`）、WS 推送、原生工具；管理编码/评审子代理，并把任务投递进已有会话。**必须装进 harness 宿主组合**（见下文） |
 | `harness/session-target.mjs` | 会话目标的纯决策层 | 目标判定、候选挑选（0/1/N 不猜）、RemoteError→稳定 reason、基线切分、汇报选文。无 DSH import，可单测；`dsh-bridge.mjs` 依赖它，**源码手工部署时保留整个 `harness/` 目录** |
 | `test/` | Node 行为回归测试 | `session-target` 纯函数单测 + `dsh-bridge` 路由级回归测试（假 DSH 运行时加载真实 bridge）。CI 每次都跑 |
-| `templates/codex-mcp/` | 反向通道配置模板 | 把 Codex CLI 当 MCP 服务端挂进 DSH（得到 `mcp__codex__*` 工具），让 DSH 侧也能调用 Codex。见下文「反向通道」 |
+| `templates/codex-mcp/` | 反向通道配置模板（**仅旧版 Codex**） | 把 Codex CLI 当 MCP 服务端挂进 DSH（得到 `mcp__codex__*` 工具）。Codex CLI 0.167 已移除 `codex mcp-server`，新版请改用官方 `subagent_codex`。见下文「反向通道」 |
 | `cordis.patch.yml` | bundle patch | 把网关插件挂进 DSH 宿主组合；`dsh.bundle.patch` 指向它，所以 `dsh plugin add` 能自动 reconcile |
 
 ## 功能
@@ -114,26 +114,32 @@ npm view @whaletalk/dsh-codex-collab version
 dsh plugin --profile desktop add @whaletalk/dsh-codex-collab
 #    ↑ DSH 客户端用的就是 desktop profile；纯 Web 部署换成 --profile web
 
-# 2) MCP 服务器交给 Codex
+# 2) 全局 CLI + Codex 侧插件/MCP（Codex CLI 0.167 实测）
 npm install -g @whaletalk/dsh-codex-collab
+codex plugin marketplace add "<包内 codex-plugin 的绝对路径>"
+codex plugin add dsh@dsh-local
+codex mcp add dsh --env DSH_BRIDGE_URL=http://127.0.0.1:3080 -- dsh-mcp
 ```
 
-之后 `dsh-mcp` / `dsh-task` / `dsh-review` 三个命令进入 PATH，`~/.codex/config.toml` 里写：
+**端口：把 DSH 桌面端固定为 3080（推荐）。** 网关挂在 profile 的 `webServer` 上；DSH 桌面客户端默认用**随机端口**（每次重启都会变），不固定的话 Codex 的 MCP 地址每次都要手工同步。在 `~/.dsh/profiles/desktop/cordis.patch.yml` 追加：
 
-```toml
-[mcp_servers.dsh]
-command = 'dsh-mcp'
-startup_timeout_sec = 120
-env = { DSH_BRIDGE_URL = "http://127.0.0.1:3080" }   # 见下方"端口"；不写则默认 3080
+```yaml
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  config:
+    host: 127.0.0.1
+    port: 3080
 ```
 
-**端口**：网关挂在 profile 的 `webServer` 上，地址取决于 profile 怎么起的——独立 harness 通常 `3080`，而 DSH 客户端里就是 **GUI 自己的端口**（例如 `http://127.0.0.1:19387`）。MCP 与 CLI 都用 `DSH_BRIDGE_URL` 找网关，指错只会看到连接失败或 401。验证：
+然后重启 DSH。独立 `dsh web` 部署直接用 `dsh --profile web --port 3080`（不传时默认也是 3080）。验证：
 
 ```sh
 curl http://127.0.0.1:3080/api/dsh-bridge/status
 ```
 
-装完**必须重启 profile 进程**——`dsh plugin add` 改的是 bundles 列表与 node_modules，HMR 不监控这两处；**替换包内容也不会热重载**（ESM 缓存），只有重启进程才加载新版本。
+> 换端口时同步改 Codex 侧：`codex mcp remove dsh && codex mcp add dsh --env DSH_BRIDGE_URL=http://127.0.0.1:<port> -- dsh-mcp`（或直接改 `~/.codex/config.toml` 的 `[mcp_servers.dsh.env]`）。
+
+装完**必须重启 profile 进程**——`dsh plugin add` 改的是 bundles 列表与 node_modules，HMR 不监控这两处；**替换包内容也不会热重载**（ESM 缓存），只有重启进程才加载新版本。Codex 侧装完插件/MCP 后重开 Codex 会话。
 
 ### 升级到新版本
 
@@ -141,7 +147,9 @@ curl http://127.0.0.1:3080/api/dsh-bridge/status
 # 将 X.Y.Z 替换成 npm 已发布的新版本号；两端使用同一版本
 dsh plugin --profile desktop add @whaletalk/dsh-codex-collab@X.Y.Z
 npm install -g @whaletalk/dsh-codex-collab@X.Y.Z
-# 保存当前工作后，重启 DSH profile，并重新加载 Codex 的 MCP 连接
+codex plugin add dsh@dsh-local     # 刷新 Codex 插件缓存到新版本（本地 marketplace）
+# 保存当前工作后，重启 DSH profile；Codex 重开会话即可。
+# MCP 地址因固定端口 3080 不变，不需要重新配置。
 ```
 
 - **不要用"卸载 → 重装"**：卸载会把这个包从 `dsh.profile.bundles` 移除；重装后若没被重新选中，插件根本不会挂载（表现：所有 `/api/dsh-bridge/*` 都落到网关鉴权层返回 **401**）。真遇到了就在客户端插件页把它的开关打开。
@@ -174,30 +182,34 @@ GET http://127.0.0.1:3080/api/dsh-bridge/status
 
 ### 2. Codex 侧（二选一或都用）
 
-**A. MCP 工具**：保留完整源码目录（包括 `mcp/` 和 `harness/`），在 `~/.codex/config.toml` 追加；不要把 `dsh-mcp.mjs` 单独拷走，它会导入 `../harness/codex-approvals.mjs`：
+**A. MCP 工具**：保留完整源码目录（包括 `mcp/` 和 `harness/`），用 0.167 的 CLI 直接注册（等价于写 `~/.codex/config.toml`；不要只拷 `dsh-mcp.mjs`，它会导入 `../harness/codex-approvals.mjs`）：
+
+```sh
+codex mcp add dsh --env DSH_BRIDGE_URL=http://127.0.0.1:3080 -- node "<项目绝对路径>/mcp/dsh-mcp.mjs"
+```
+
+等价的 `config.toml` 写法（手工改可读性更好）：
 
 ```toml
 [mcp_servers.dsh]
 command = 'node'
 args = ['<项目绝对路径>/mcp/dsh-mcp.mjs']
 startup_timeout_sec = 120
+env = { DSH_BRIDGE_URL = "http://127.0.0.1:3080" }
 ```
 
-重启 Codex，会话中出现 `mcp__dsh__*` 工具。
+重启 Codex 会话后出现 `mcp__dsh__*` 工具。
 
-**B. 本地市场插件（技能形式）**：把 `codex-plugin/` 放到任意位置，在个人市场清单 `~/.agents/plugins/marketplace.json` 中追加插件条目（`"path": "./plugins/dsh"`），并把插件目录放到 `~/plugins/dsh/`，然后：
+**B. 本地市场插件（技能形式）**：Codex CLI 0.167 起用官方 marketplaces 命令安装（本机实测通过）：
 
-```bash
-codex plugin add dsh@personal
+```sh
+codex plugin marketplace add "<项目绝对路径>/codex-plugin"
+codex plugin add dsh@dsh-local
 ```
 
-npm 安装后，插件目录已在包内，用一行拿到绝对路径：
+`codex plugin list` 应显示 `dsh@dsh-local  installed, enabled  <版本>`。旧版 Codex（<0.167）仍可按 `~/.agents/plugins/marketplace.json` 的本地市场清单方式手工登记。
 
-```bash
-node -p "require.resolve('@whaletalk/dsh-codex-collab/package.json').replace(/package\.json$/,'codex-plugin')"
-```
-
-> ⚠️ 已知问题：Codex Desktop 26.803 在 Windows 上存在插件技能不注入会话的 bug（[openai/codex#26037](https://github.com/openai/codex/issues/26037)、[#22078](https://github.com/openai/codex/issues/22078)）。技能形式可能不生效，**以 MCP 方式为准**。
+> ⚠️ 旧版 Codex Desktop 在 Windows 上存在插件技能不注入会话的 bug（[openai/codex#26037](https://github.com/openai/codex/issues/26037)、[#22078](https://github.com/openai/codex/issues/22078)）。0.167 实测本地 marketplace 已可安装并识别 `skills/`；技能仍不生效时**以 MCP 方式为准**。
 
 ### 3. ChatGPT 普通聊天区（可选，受账户限制）
 
@@ -290,19 +302,34 @@ dsh-task --in "<继续推进的指令>" --session "session-example-…" --origin
 
 | 含义 | 可行性 |
 |---|---|
-| 让 DSH 调用 Codex（把 Codex 当执行器/评审员） | ✅ 可用内置 MCP，或单独启用官方 Codex 子代理，见下 |
+| 让 DSH 调用 Codex（把 Codex 当执行器/评审员） | ✅ 新版用官方 Codex 子代理（方案 A）；旧版 Codex（≤ 0.1xx）还可用内置 MCP 反向通道（方案 C） |
 | 让 DSH 往你**正开着的某条 ChatGPT/Codex 对话**里插一条消息、就地开一轮 | 本插件尚未提供桌面附着与空闲唤醒通道 |
 
 来源对话 ID 与任务 ID 解决的是**派活结果归属**，不等于附着或唤醒桌面聊天。下述反向后端会启动它们自己的 Codex 会话；官方子代理的完成通知回到 DSH 父会话。当前本机桌面附着的历史探测见下文 M0 记录，不能据此推断所有平台或未来版本的能力。
 
-### 方案 A：内置 MCP 反向通道
+### 方案 A：官方 Codex 子代理（新版首选）
 
-**装本包就同时得到两个方向**——`cordis.patch.yml` 里插了两行：`dsh-bridge`（Codex → DSH 派活）与 `codex-mcp`（DSH → Codex 反向调用）。原理是两端各有一个原生件：
+`@deepseek-ai/dsh-subagent-codex` 是 DSH 官方包：由 DSH 直接驱动 Codex CLI，提供全局工具 **`subagent_codex`**，每次任务新建临时 Codex 线程，完成后回传答案或失败信息，不支持给这次子任务续聊。本插件与它共存——Codex → DSH 派活、queue/steer、来源绑定与审批委托继续由网关负责。
 
-- DSH 侧 `@deepseek-ai/dsh-mcp-client`（harness 自带）：连外部 MCP 服务器，并把工具以 `mcp__<serverName>__<tool>` 注册进 `ctx.tools`；
-- Codex 侧 `codex mcp-server`（stdio）：把 Codex 暴露成 MCP 服务端。
+官方运行时是**独立可选依赖**，本包不会自动安装它。应选择与当前 DSH 宿主配套的版本；例如宿主为 `0.2.2-rc.1`：
 
-内置的那一行等价于：
+```sh
+dsh plugin --profile desktop add @deepseek-ai/dsh-subagent-codex@0.2.2-rc.1
+```
+
+Codex 侧仍使用我们的 `dsh` 协作插件和 MCP/CLI，无需另装一个同名官方插件。首次使用请按[集成指南](docs/OFFICIAL_CODEX_SUBAGENT.md)检查登录、模型与权限；[配置片段](templates/codex-subagent/cordis.patch.yml)只覆盖官方 provider，不重复注册工具。
+
+### 方案 B：worker 里直接跑 `codex exec`
+
+```powershell
+codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
+```
+
+一次性、零协议改动；代价是每次都是新会话（无跨轮记忆），且需要执行 shell 的权限。
+
+### 方案 C：旧版 Codex 的 MCP 反向通道（可选，仅 Codex CLI ≤ 0.1xx）
+
+Codex CLI **0.167 已移除 `codex mcp-server`**（`codex help mcp-server` → `unrecognized subcommand`），因此本包自 **0.1.12 起不再内置**这条通道；新版请用方案 A。仍在使用旧版 Codex CLI（约 ≤ 0.1xx）的用户，可按 [`templates/codex-mcp/`](templates/codex-mcp/README.md) 把下面这段 `insert` 合并进 profile 的 `cordis.patch.yml`（装完重启 profile）：
 
 ```yaml
 - insert:
@@ -317,31 +344,9 @@ dsh-task --in "<继续推进的指令>" --session "session-example-…" --origin
         toolCallTimeoutMs: 600000      # 默认只有 60s，Codex 跑一轮常常不够
 ```
 
-- 前提：本机装了 Codex CLI 并已登录（`codex --version` / `codex mcp-server --help` 能跑）。
-- **不需要反向通道**？在 profile 的 `cordis.patch.yml` 里覆盖一行即可关掉：`- id: codex-mcp` + `disabled: true`。
+- 前提：`codex --version` / `codex mcp-server --help` 能跑（旧版 Codex）。
 - 想单独用反向通道（不装本插件主体）可以用独立模板 [`templates/codex-mcp/`](templates/codex-mcp/README.md)。
 - 装完需**重启 profile 进程**；连接失败只是这批工具不出现（日志里有原因）。
-- 排查：若 `codex` 不在 DSH 进程的 PATH 上，把 `command` 换成 `node` + `args: ['<...>/@openai/codex/bin/codex.js', 'mcp-server']`，或直接指向平台 `codex.exe`。
-
-### 方案 B：官方 Codex 子代理（可选，单独安装）
-
-已有网关可以与 `@deepseek-ai/dsh-subagent-codex` 共存。官方包在 DSH 中提供全局工具 **`subagent_codex`**：每次任务新建临时 Codex 线程，完成后回传答案或失败信息，不支持给这次子任务续聊。我们的 Codex → DSH 派活、queue/steer、来源绑定与审批委托继续由网关负责。
-
-官方运行时是**独立可选依赖**，本包不会自动安装它。应选择与当前 DSH 宿主配套的版本；例如宿主为 `0.2.1-rc.2`：
-
-```sh
-dsh plugin --profile desktop add @deepseek-ai/dsh-subagent-codex@0.2.1-rc.2
-```
-
-Codex 侧仍使用我们的 `dsh` 协作插件和 MCP/CLI，无需另装一个同名官方插件。首次使用请按[集成指南](docs/OFFICIAL_CODEX_SUBAGENT.md)检查登录、模型与权限；[配置片段](templates/codex-subagent/cordis.patch.yml)只覆盖官方 provider，不重复注册工具。旧 MCP 通道可保留供持续对话使用，也可显式关闭。
-
-### 方案 C：worker 里直接跑 `codex exec`
-
-```powershell
-codex exec "把刚才的 diff 审一遍，只回结论" --cd E:\proj
-```
-
-一次性、零协议改动；代价是每次都是新会话（无跨轮记忆），且需要执行 shell 的权限。
 
 > 注意：插件自带的 `dsh_collab_send` / `dsh_collab_review` 是 **DSH 侧入口**，只回到同一个网关，**不经过 Codex**。要"叫 Codex 干活"用上面 A/B/C；本包的来源绑定与结果查询不代表能自动唤醒当前 Codex 桌面对话。
 
@@ -472,7 +477,8 @@ dsh-task --status <taskId> --origin <id> --grant <grantId> --status-wait
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DSH_BRIDGE_URL` | `http://127.0.0.1:3080` | 网关地址。**必须指向插件实际挂载的那个 profile 的端口**（DSH 客户端里就是 GUI 端口，例如 19387） |
+| `DSH_BRIDGE_URL` | `http://127.0.0.1:3080` | 网关地址。**建议按上文把 DSH 桌面端固定到 3080**；不固定时它是 GUI 的随机端口，每次重启都会变 |
+| `DSH_COLLAB_SUBAGENT_PROVIDER` | 自动（`subagent → spawn → fork`） | 强制指定 worker/reviewer 使用的 subagent provider；外部 provider（如官方 `codex`）不允许，仍会回退到白名单 |
 | `DSH_BRIDGE_WORKSPACE` | `D:\Harness` | 网关默认共享工作目录 |
 | `DSH_BRIDGE_ROOT` | `D:\Harness` | `dsh_read_file` 相对路径基准 |
 | `DSH_BRIDGE_HISTORY` | 多级降级 | 协作历史文件位置（默认 D 盘 → 用户目录 → 临时目录逐级降级） |
@@ -516,7 +522,8 @@ node --test test/*.test.mjs            # 全部行为回归（CI 用的是这条
 ```
 
 - 路由级测试会断言 **worker 分支确实调用了 `startContinuable`**、**session 分支只调用 `prompt` 且不建 owner/子代理**——这类"参数遮蔽/串线"缺陷只有在这一层才抓得到（v0.1.2~0.1.4 的 `deliver` 遮蔽 bug 就是它抓回来的）。
-- CI（`.github/workflows/publish.yml`）每次 tag 都跑：语法检查 → 单测 → 包契约 → 版本号三处一致 → tarball 清单 → 干净目录安装 + CLI/MCP 冒烟 → 8 工具握手断言 → bridge 导出契约。**任何一步失败都不会发布**。
+- `test/dsh-compat.test.mjs` 是宿主/边界守卫：DSH 升级时核对 `engines.dsh` 与 SDK 入口是否漂移；同时断言 bundle patch 不再内置 Codex 0.167 已移除的 `codex mcp-server`，而旧版模板仍保留该可选通道。
+- CI（`.github/workflows/publish.yml`）每次 tag 都跑：语法检查 → 单测（当前 **242 项**）→ 包契约 → 版本号三处一致 → tarball 清单 → 干净目录安装 + CLI/MCP 冒烟 → **9 工具**握手断言 → bridge 导出契约。**任何一步失败都不会发布**。
 - 发布：`package.json` / `.codex-plugin/plugin.json` / `mcp/dsh-mcp.mjs` 的 `SERVER_VERSION` 三处同步改版本 → commit → 打 tag `vX.Y.Z` → 推 tag，CI 自动带 provenance 发布。
 
 ## 项目来源与鸣谢

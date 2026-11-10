@@ -957,6 +957,12 @@ export async function apply(ctx) {
     return bucket.promise
   }
 
+  // DSH 0.2.2 起内置 provider 名是 `spawn` / `fork`（`subagent` 是 0.2.0 旧名）。
+  // `codex` 这类外部 provider（官方 @deepseek-ai/dsh-subagent-codex 注册）走 Codex CLI 自己的
+  // 权限系统，不是本插件的 "DSH 编码工人" 语义——绝不能在 subagents.list() 里按顺序盲选到它。
+  // 可用 DSH_COLLAB_SUBAGENT_PROVIDER 显式指定（仍然禁止指向外部 provider）。
+  const LOCAL_PROVIDER_PREFERENCE = ['subagent', 'spawn', 'fork']
+  const EXTERNAL_PROVIDERS = new Set(['codex'])
   const supportsContinuable = (name) => {
     try {
       const p = subagents.getProvider(name)
@@ -964,10 +970,14 @@ export async function apply(ctx) {
     } catch (e) { return false }
   }
   const pickProvider = () => {
-    if (supportsContinuable('subagent')) return 'subagent'
+    const override = typeof process.env.DSH_COLLAB_SUBAGENT_PROVIDER === 'string'
+      ? process.env.DSH_COLLAB_SUBAGENT_PROVIDER.trim()
+      : ''
+    if (override !== '' && !EXTERNAL_PROVIDERS.has(override) && supportsContinuable(override)) return override
+    for (const name of LOCAL_PROVIDER_PREFERENCE) if (supportsContinuable(name)) return name
     let names = []
     try { names = subagents.list() } catch (e) { return undefined }
-    for (const n of names) if (supportsContinuable(n)) return n
+    for (const n of names) if (!EXTERNAL_PROVIDERS.has(n) && supportsContinuable(n)) return n
     return undefined
   }
   const ROLE_BRIEF = (cwd) => [
@@ -3377,7 +3387,7 @@ export async function apply(ctx) {
       // 这份清单能在"接不上会话"时直接告诉我们到底缺哪个服务。
       const probe = (name) => { try { return ctx.get(name) !== undefined } catch (e) { return false } }
       const out = {
-        pending: 0, historyCount: history.length, presets: [], providers: [], buckets: [], reviewers: [],
+        pending: 0, historyCount: history.length, presets: [], providers: [], provider: null, buckets: [], reviewers: [],
         sessionController: probe('sessionController'),
         services: Object.fromEntries(['sessionController', 'connection', 'sessionQuery', 'sessionPersistence', 'workspaceRegistry', 'agents', 'subagents', 'agentPresets', 'timer', 'llm'].map((n) => [n, probe(n)])),
         sessionTargets: [], models: knownModels, modelProvider, modelListError, workspaces: [],
@@ -3388,6 +3398,7 @@ export async function apply(ctx) {
       }
       out.pending = tasks.filter((t) => isNonTerminal(t)).length
       try { out.providers = subagents.list() } catch (e) { out.providers = ['list failed: ' + errText(e)] }
+      try { out.provider = pickProvider() ?? null } catch (e) { out.provider = 'pick failed: ' + errText(e) }
       if (agentPresets !== undefined) {
         try {
           const list = await agentPresets.list()

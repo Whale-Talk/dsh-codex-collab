@@ -3,9 +3,22 @@
 范围：`session-dd9655aa-b99f-4e36-b914-a5035fd094e1`（原 DSH 项目会话）实施，Root 独立验收。
 本文件只记录**可复现的真实证据**与**明确缺口**；不冒充远端模型健康、不冒充 Desktop 验收。
 
-复核对象：`D:/Program Files (x86)/DSH/resources/app.asar`（SDK 0.2.0-rc.2，只读）。
+复核对象：`D:/Program Files (x86)/DSH/resources/app.asar`（**SDK 0.2.2-rc.1**，只读；本文件 §1–§3 的行号是 **0.2.0-rc.2** 时记录的基线）。
 复核方式：本插件独立从 asar 只读提取 `lib/*.js` 文本并按行定位（脚本 `.m0-check.mjs`，一次性），
 与 Root 只读笔记 `model-routing-sdk-notes.md` 交叉对照；**下表的行号由本插件自己复核得到**（个别与笔记不同处按本表为准）。
+
+## 0. 宿主版本适配（0.2.2-rc.1）
+
+DSH 于 2026-11-04 升级到 **0.2.2-rc.1**（`dsh-app-boot`/`dsh-agent-loop`/`dsh-subagent`/`dsh-llm` 等同批 0.2.2-rc.1，
+`cordis 4.1.0`）。本插件按新宿主更新了**证据与契约测试**，生产接线本身不变：
+
+| 变化 | 0.2.0-rc.2（§1–§3 基线） | 0.2.2-rc.1（当前） | 本插件处理 |
+|---|---|---|---|
+| 审批状态的来源 | `ApprovalService` 自己维护 policy/turnOpen | 改为 **`ctx.sessionProjections` 投影**：`approvalStateDefinition`（key `approvalState`）由 `sessionProjections.register` 提供，`approvalStateOf(session)` 读 `handle.stateOf(session)` | 生产仍只挂 `approval/request` 瀑布并观察官方 `approval/asked|decided`；`test/approval-native.test.mjs` 改为用**真实 `SessionProjectionRegistry` + `Service.init`** 验证同一契约 |
+| 回合/步进边界 | `dsh-agent-loop` 导出 `turnBoundaryProjectionDefinition` | 定义移到 **`dsh-agent`**（`stateVersion: 2`，内部常量，不再直接导出），公开面是 **`ctx.agents.turnBoundaryOf(session)`**（真实投影） | `test/delivery-native.test.mjs` 改用真实 `AgentRegistry` + 投影读取 `turnBoundaryOf(session)`，断言原语义（含 0.2.2 新增 `lastStepStartSeq`） |
+| 关键 hook / API | — | `agent/inbox/claimed`、`agent/request-error`、`prepareRequest`、`startActivation`、`isOwnedBy`、`listProviders/listModels/resolveModelInfo`、`defineTool` 等仍存在（行号后移） | 新增 `test/dsh-compat.test.mjs`：只读 asar 校验 `engines.dsh` 覆盖当前宿主 + 上述入口存在，宿主再升级时第一时间失败 |
+| 全局默认模型 | `selectModel` → `agentDefaultModel.saveSelection` | 不变（仍**绝不使用**） | `test/dsh-compat.test.mjs` 仅确认该入口存在（用于"知道它存在但不调用"的边界） |
+
 
 ## 1. 目录与能力 API（真实存在，非镜像）
 

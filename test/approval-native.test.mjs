@@ -24,7 +24,7 @@ let hasAsar = false
 try { fs.accessSync(ASAR); hasAsar = true } catch (e) { hasAsar = false }
 const SKIP = hasAsar ? false : 'app.asar 不在本机（DSH_ASAR=' + ASAR + '）——没有真实 SDK 就诚实跳过，绝不以 mock 冒充 native 证据'
 
-const roots = ['@deepseek-ai/cordis', '@deepseek-ai/dsh-user-approval', '@deepseek-ai/dsh-scope', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-llm', '@deepseek-ai/schemastery']
+const roots = ['@deepseek-ai/cordis', '@deepseek-ai/dsh-user-approval', '@deepseek-ai/dsh-session-projection', '@deepseek-ai/dsh-scope', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-llm', '@deepseek-ai/schemastery']
 let nativePromise = null
 let outDir = null
 
@@ -86,7 +86,8 @@ async function loadNative() {
       const cordis = await import(pathToFileURL(path.join(nm, '@deepseek-ai/cordis/lib/index.js')).href)
       const approvalMod = await import(pathToFileURL(path.join(nm, '@deepseek-ai/dsh-user-approval/lib/index.js')).href)
       const scopeMod = await import(pathToFileURL(path.join(nm, '@deepseek-ai/dsh-scope/lib/index.js')).href)
-      return { cordis, approvalMod, scopeMod, packages: seen.size, nm }
+      const projectionMod = await import(pathToFileURL(path.join(nm, '@deepseek-ai/dsh-session-projection/lib/index.js')).href)
+      return { cordis, approvalMod, scopeMod, projectionMod, packages: seen.size, nm }
     } catch (e) {
       nativePromise = null
       throw e
@@ -101,15 +102,39 @@ after(() => {
   }
 })
 
+/**
+ * DSH 0.2.2 起 ApprovalService 用 **session projection** 读 policy/turnOpen
+ * （`ctx.sessionProjections.register(...)` 后 `handle.stateOf(session)`）。
+ * 因此这里给真实服务提供真实 SessionProjectionRegistry，并让 fake session 满足投影读取面：
+ * `header / inheritedEventCount / seq / eventAt / snapshotEvents / append`。
+ */
 const makeSession = (withOpenTurn = true) => {
   const events = []
   if (withOpenTurn) events.push({ seq: 0, type: 'turn/start', data: { turn: 1 } })
   return {
+    header: { id: 'native-approval-probe' },
+    inheritedEventCount: 0,
     get seq() { return events.length },
     eventAt(seq) { return events[Number(seq)] },
+    snapshotEvents(from, to) {
+      const start = from === undefined ? 0 : Number(from)
+      const end = to === undefined ? events.length : Number(to)
+      return events.slice(start, end)
+    },
     append(type, data) { events.push({ seq: events.length, type, data }); return events.length },
     events,
   }
+}
+
+/** 建一个带真实 sessionProjections 的 ctx，并建好**已完成 Service.init** 的 ApprovalService（0.2.2 必需）。 */
+const makeApprovalContext = async (cordis, approvalMod, projectionMod, policy = 'ask') => {
+  const ctx = new cordis.Context()
+  const projections = new projectionMod.SessionProjectionRegistry(ctx)
+  assert.equal(typeof ctx.sessionProjections?.register, 'function', 'sessionProjections 必须挂到 ctx（ApprovalService inject 它）')
+  void projections
+  const approval = new approvalMod.ApprovalService(ctx, { policy })
+  await approval[cordis.Service.init]()
+  return { ctx, approval }
 }
 
 test('native: 真实 cordis waterfall——prepend 次序 / 不调 next 否决整链 / 空链默认值', { skip: SKIP }, async () => {
@@ -126,9 +151,8 @@ test('native: 真实 cordis waterfall——prepend 次序 / 不调 next 否决�
 })
 
 test('native: 真实 ApprovalService——放行链/单次 allowed-once/审计对同 id/下游独占', { skip: SKIP }, async () => {
-  const { cordis, approvalMod } = await loadNative()
-  const ctx = new cordis.Context()
-  const approval = new approvalMod.ApprovalService(ctx, { policy: 'ask' })
+  const { cordis, approvalMod, projectionMod } = await loadNative()
+  const { ctx, approval } = await makeApprovalContext(cordis, approvalMod, projectionMod)
   const session = makeSession(true)
   const agent = { session }
   const calls = []
@@ -147,20 +171,18 @@ test('native: 真实 ApprovalService——放行链/单次 allowed-once/审计�
   assert.equal(asked[0].data.callId, 'c-native')
 
   // 独占：我们的答复者不调 next（等价于谓词成立、直接决定）→ 下游不被调用
-  const ctx2 = new cordis.Context()
-  const approval2 = new approvalMod.ApprovalService(ctx2, { policy: 'ask' })
+  const second = await makeApprovalContext(cordis, approvalMod, projectionMod)
   const calls2 = []
-  ctx2.on('approval/request', async () => { calls2.push('ours'); return 'allowed-once' }, { prepend: true })
-  ctx2.on('approval/request', async () => { calls2.push('human'); return 'rejected' })
-  const outcome2 = await approval2.request({ agent: { session: makeSession(true) }, toolName: 'bash', callId: 'c-take' })
+  second.ctx.on('approval/request', async () => { calls2.push('ours'); return 'allowed-once' }, { prepend: true })
+  second.ctx.on('approval/request', async () => { calls2.push('human'); return 'rejected' })
+  const outcome2 = await second.approval.request({ agent: { session: makeSession(true) }, toolName: 'bash', callId: 'c-take' })
   assert.equal(outcome2, 'allowed-once')
   assert.deepEqual(calls2, ['ours'], '直接决定时必须完全不触碰下游（不吞≠必调用）')
 })
 
 test('native: 真实 ApprovalService——never 先拒(零 answerer)/无 open turn throw/signal→cancelled/非法与抛错归一 unavailable', { skip: SKIP }, async () => {
-  const { cordis, approvalMod } = await loadNative()
-  const ctx = new cordis.Context()
-  const approval = new approvalMod.ApprovalService(ctx, { policy: 'ask' })
+  const { cordis, approvalMod, projectionMod } = await loadNative()
+  const { ctx, approval } = await makeApprovalContext(cordis, approvalMod, projectionMod)
   const calls = []
   ctx.on('approval/request', async (req, next) => { calls.push('asked:' + req.callId); return next() }, { prepend: true })
   ctx.on('approval/request', async (req, next) => {

@@ -5,6 +5,7 @@
 - 审查对象：`docs/CODEX_DSH_APPROVAL_DELEGATION_PLAN.md`（本文件只读它，未改动）
 - 本轮动作：**只读取证 + 写本文件**。未改任何生产代码、未安装、未改权限/preset/never、未重启客户端、未读凭据或用户其它会话存储。
 - 证据来源（全部只读）：本机官方安装包 `D:/Program Files (x86)/DSH/resources/app.asar`；提取/扫描工具在 `E:/07-Workspace_codex/.tmp/dsh-approval-protocol/`（`scan-approval.mjs`，只读 asar，产物写 `.tmp`）。**不把任何 SDK 文件复制成运行时依赖。**
+- **宿主版本说明（2026-11-06 追记）**：本文件取证时宿主为 SDK **0.2.0-rc.2**，故下文行号是当时基线。DSH 已升级到 **0.2.2-rc.1**：`ApprovalService` 改为经 `ctx.sessionProjections` 的 `approvalStateDefinition` 投影读 policy/turnOpen（`approval/request` 瀑布、官方 `approval/asked|decided` 审计、`never` 先拒、signal→cancelled、非法返回归一 unavailable 等**契约未变**）。本插件的 `test/approval-native.test.mjs` 已改用真实 `SessionProjectionRegistry` + `Service.init` 复验同一组断言；跨版本入口存在性由 `test/dsh-compat.test.mjs` 守卫。
 
 ## 0. 结论摘要
 

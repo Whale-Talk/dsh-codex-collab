@@ -194,7 +194,7 @@ jobs:
             console.log("bridge ok:", mod.name, "inject=[" + mod.inject.join(",") + "]");
           '
 
-      - name: Bundle patch rows resolve
+      - name: Bundle patch rows resolve (no removed codex mcp-server)
         run: |
           set -euo pipefail
           node -e '
@@ -220,14 +220,14 @@ jobs:
             if (rows.get("dsh-bridge") !== sub) {
               throw new Error("dsh-bridge row must be " + sub + ", got " + rows.get("dsh-bridge"));
             }
-            // The bundled reverse channel mounts DSH own MCP client; assert it is
-            // present and configured for the Codex CLI, since it ships to users.
-            if (rows.get("codex-mcp") !== "@deepseek-ai/dsh-mcp-client") {
-              throw new Error("codex-mcp row must be @deepseek-ai/dsh-mcp-client, got " + rows.get("codex-mcp"));
-            }
-            if (!/command:\s*codex\b/.test(patch)) throw new Error("codex-mcp row must launch the codex CLI");
-            if (!/args:\s*\[.mcp-server.\]/.test(patch)) throw new Error("codex-mcp row must pass mcp-server");
-            console.log("patch ok:", rows.size, "rows —", [...rows].map(([k, v]) => k + "=" + v).join(", "));
+            // Codex CLI 0.167 removed `codex mcp-server`; shipping that row fails
+            // silently for every new user, so the bundle must no longer include it.
+            if (rows.has("codex-mcp")) throw new Error("bundle patch must not ship the retired codex-mcp row");
+            if (/args:\s*\[[^\]]*mcp-server/.test(patch)) throw new Error("bundle patch must not launch the removed codex mcp-server");
+            // The legacy opt-in lives in templates/codex-mcp for old Codex users.
+            const template = fs.readFileSync("templates/codex-mcp/cordis.patch.yml", "utf8");
+            if (!/mcp-server/.test(template)) throw new Error("templates/codex-mcp must keep the legacy reverse channel config");
+            console.log("patch ok:", rows.size, "row(s) —", [...rows].map(([k, v]) => k + "=" + v).join(", "));
           '
 
   publish:

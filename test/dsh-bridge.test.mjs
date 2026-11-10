@@ -111,6 +111,10 @@ const makeHarness = async (options = {}) => {
   const agentHandlers = new Map()
   const assocRoot = options.assocRoot === undefined ? await mkdtemp(path.join(tmpParent, 'dsh-assoc-')) : options.assocRoot
   assocRoots.push(assocRoot)
+  // provider 选择回归：默认仍是旧名 `subagent`；新用例可注入 DSH 0.2.2 的 spawn/fork/codex。
+  const providerSpec = options.subagentProviders === undefined
+    ? { subagent: { prepareContinuable() {} } }
+    : options.subagentProviders
   const onCtx = (name, fn) => {
     const set = ctxHandlers.get(name) || new Set()
     set.add(fn)
@@ -161,10 +165,10 @@ const makeHarness = async (options = {}) => {
     },
     subagents: {
       list() {
-        return ['subagent']
+        return Object.keys(providerSpec)
       },
-      getProvider() {
-        return { prepareContinuable() {} }
+      getProvider(name) {
+        return providerSpec[name]
       },
       async startContinuable(args) {
         starts.push(args)
@@ -247,6 +251,66 @@ test('POST /task: default worker dispatch starts a continuable subagent', async 
   assert.equal(harness.starts[0].provider, 'subagent')
   assert.equal(harness.starts[0].label, 'codex-collab-worker-main')
   assert.match(harness.starts[0].request.prompt[0].text, /跑一个 worker 回归测试/)
+})
+
+test('provider 选择：DSH 0.2.2 的 spawn/fork 优先，外部 codex 永不选中', async () => {
+  const harness = await makeHarness({
+    subagentProviders: {
+      spawn: { prepareContinuable() {} },
+      fork: { prepareContinuable() {} },
+      codex: { start() {} },
+    },
+  })
+  const debug = harness.routes.get('/api/dsh-bridge/debug')
+  const status = await callGet(debug, '/api/dsh-bridge/debug')
+  assert.equal(status.statusCode, 200)
+  assert.deepEqual(status.body.providers, ['spawn', 'fork', 'codex'])
+  assert.equal(status.body.provider, 'spawn', '优先 DSH 本地的 spawn，而不是外部 codex')
+
+  const task = harness.routes.get('/api/dsh-bridge/task')
+  const res = await callJson(task, { instruction: 'provider 回归', cwd: 'E:/tmp/dsh-provider' })
+  assert.equal(res.statusCode, 202)
+  assert.equal(harness.starts.length, 1)
+  assert.equal(harness.starts[0].provider, 'spawn')
+})
+
+test('provider 选择：DSH_COLLAB_SUBAGENT_PROVIDER 可覆盖，但外部 codex 被拒绝', async () => {
+  const previous = process.env.DSH_COLLAB_SUBAGENT_PROVIDER
+  try {
+    process.env.DSH_COLLAB_SUBAGENT_PROVIDER = 'fork'
+    const harness = await makeHarness({
+      subagentProviders: {
+        spawn: { prepareContinuable() {} },
+        fork: { prepareContinuable() {} },
+        codex: { prepareContinuable() {} },
+      },
+    })
+    const debug = harness.routes.get('/api/dsh-bridge/debug')
+    const res = await callGet(debug, '/api/dsh-bridge/debug')
+    assert.equal(res.body.provider, 'fork')
+
+    process.env.DSH_COLLAB_SUBAGENT_PROVIDER = 'codex'
+    const rejected = await makeHarness({
+      subagentProviders: {
+        spawn: { prepareContinuable() {} },
+        fork: { prepareContinuable() {} },
+        codex: { prepareContinuable() {} },
+      },
+    })
+    const res2 = await callGet(rejected.routes.get('/api/dsh-bridge/debug'), '/api/dsh-bridge/debug')
+    assert.equal(res2.body.provider, 'spawn', '外部 codex provider 不允许作为覆盖值')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_COLLAB_SUBAGENT_PROVIDER
+    else process.env.DSH_COLLAB_SUBAGENT_PROVIDER = previous
+  }
+})
+
+test('provider 选择：只有外部 codex 可继续时明确不可用（不降级到 Codex）', async () => {
+  const harness = await makeHarness({ subagentProviders: { codex: { prepareContinuable() {} } } })
+  const debug = harness.routes.get('/api/dsh-bridge/debug')
+  const res = await callGet(debug, '/api/dsh-bridge/debug')
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.body.provider, null, '外部 codex provider 不能冒充 DSH 编码工人')
 })
 
 test('POST /task: session dispatch preserves queue and steer delivery modes', async () => {

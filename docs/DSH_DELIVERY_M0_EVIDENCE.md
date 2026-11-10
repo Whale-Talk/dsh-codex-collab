@@ -44,8 +44,11 @@
 → 队列是**会话持久状态**：网关重启不丢队列，官方自己保证顺序；`removedCount` 是**事件字段**（记录"这次 splice 移除了几条"），
 它描述的是**官方自己写事件时**的语义，**不等于**我们可以伪写会话日志去做"撤队"——我们不向会话日志写任何 inbox 事件（首次验收修正 G）。
 
-**导出的边界投影**（测试用真实组件跑）：`turnBoundaryProjectionDefinition`（`key:'turnBoundary'`, `:1353–1398`）物化 `openTurnStartSeq / lastStepStartSeq / lastStepBoundary / lastTurn`
+**导出的边界投影**（测试用真实组件跑）：`turnBoundaryProjectionDefinition`（`key:'turnBoundary'`, `:1353–1398`，**0.2.0-rc.2 基线**）物化 `openTurnStartSeq / lastStepStartSeq / lastStepBoundary / lastTurn`
 —— 这就是"父回合是否仍开放"与"步进边界"的官方判据，队列消费时机依赖它。
+**DSH 0.2.2-rc.1 变化**：该定义已移入 `@deepseek-ai/dsh-agent`（`stateVersion: 2`，内部常量不再导出），公开读取面是真实的
+`ctx.agents.turnBoundaryOf(session)`（`SessionProjectionRegistry` 投影）；本插件的契约测试已改为用真实 `AgentRegistry` + 投影验证同一语义
+（见 `test/delivery-native.test.mjs`），语义与队列消费判据不变。
 
 ## 3. 设计结论（对实现的硬约束）
 

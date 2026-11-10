@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.12 — 2026-11-11
+
+- 适配 **Codex CLI 0.167**：`codex mcp-server` 已被移除（`codex help mcp-server` → `unrecognized subcommand`）。bundle 的 `cordis.patch.yml` 自本版起**不再内置 `codex-mcp` 反向通道**（旧配置在新版只剩静默失败）；仅旧版 Codex（≤ 0.1xx）需要时，按 `templates/codex-mcp/` 手动合并该 `insert` 行。
+- Codex 侧安装改用 0.167 的官方命令：`codex plugin marketplace add` + `codex plugin add` + `codex mcp add`（README / `templates/codex-mcp` / `docs/OFFICIAL_CODEX_SUBAGENT.md` 同步更新）。DSH→Codex 新版路径推荐官方 `@deepseek-ai/dsh-subagent-codex`（工具 `subagent_codex`）。
+- 适配 **DSH 0.2.2-rc.1 的 provider 名变化**（`subagent` → `spawn`/`fork`，并存外部 `codex` provider）：provider 选择改为显式白名单 `subagent → spawn → fork`，**外部 `codex` provider 永不被自动选中**（避免 DSH 编码工人被误派给 Codex CLI）；可用 `DSH_COLLAB_SUBAGENT_PROVIDER` 显式覆盖（外部 provider 会被拒绝）。`/api/dsh-bridge/debug` 新增 `provider` 字段显示实际选择。
+- 新增回归：spawn/fork 优先、`codex` 排除、环境变量覆盖（3 项）；宿主守卫新增 bundle patch 反向通道退役断言。测试总数 **242**。
+- README 增加「把 DSH 桌面端固定到 3080」的 profile patch（`webserver` 行覆盖），使 Codex 的 `DSH_BRIDGE_URL` 长期有效；桌面端默认随机端口、每次重启都会变。
+- 生产派活/审批/来源绑定/模型路由契约不变。
+
+## 0.1.11 — 2026-11-06
+
+- 适配 DSH **0.2.2-rc.1**：真实 SDK 契约测试改用新的会话投影机制（`ApprovalService` 现在通过 `ctx.sessionProjections` 读 policy/turnOpen；回合/步进边界由 `dsh-agent` 的 `turnBoundaryOf(session)` 投影提供，`dsh-agent-loop` 不再导出该定义）。断言的行为不变，236 项全部通过。
+- 声明 `engines.dsh`（`>=0.2.0-0 <0.3.0`），让 DSH 的插件兼容检查在宿主跨大版本升级时直接拒绝装载而不是运行期出错。
+- 新增宿主契约守卫测试 `test/dsh-compat.test.mjs`：只读当前安装的 `app.asar`，核对 DSH 版本落在声明范围内，并逐项检查本插件依赖的 SDK 入口仍存在（`defineTool`、`sessionProjections/stateOf`、`turnBoundaryOf`、`startActivation`/`isOwnedBy`、`agent/inbox/claimed`/`agent/request-error`、`listProviders`/`listModels` 等）。DSH 再次升级时可第一时间暴露漂移。
+- 生产逻辑无行为变更；审批委托、来源绑定 queue/steer、模型目录与自动选择/有界故障切换契约保持不变。
+
 ## 0.1.10 — 2026-10-20
 
 - 修复大对话每 2.5 秒全量读取：同会话共享 SDK 增量事件/有界 follow，低成本观察只用于初始化或补缺；慢检查互斥、失败退避，空闲 worker 零历史读取。

@@ -1,9 +1,13 @@
-# templates/codex-mcp —— 反向通道：让 DSH 调用 Codex
+# templates/codex-mcp —— 反向通道：让 DSH 调用 Codex（仅旧版 Codex）
 
-> **注意：主包已内置这一行。** 装 `@whaletalk/dsh-codex-collab` 时会同时挂上
-> `dsh-bridge`（Codex → DSH 派活）和 `codex-mcp`（DSH → Codex），不需要再单独装。
-> 本目录是**独立版本**：只想用反向通道、或想单独调参时用。关掉内置的那一行只需在
-> profile 的 `cordis.patch.yml` 里覆盖 `- id: codex-mcp` + `disabled: true`。
+> **⚠️ 仅适用于仍带 `codex mcp-server` 的旧版 Codex CLI（约 ≤ 0.1xx）。**
+> Codex CLI **0.167.0** 已移除该命令（`codex help mcp-server` → `unrecognized
+> subcommand 'mcp-server'`），在 0.167 上本目录的配置只会静默启动失败。
+> 新版请改用 DSH 官方 `@deepseek-ai/dsh-subagent-codex`（工具 `subagent_codex`），
+> 见 `docs/OFFICIAL_CODEX_SUBAGENT.md`。
+>
+> **主包自 0.1.12 起不再内置这一行。** 装 `@whaletalk/dsh-codex-collab` 只会挂
+> `dsh-bridge`（Codex → DSH 派活）；本目录是给旧版 Codex 用户的**可选**补充。
 
 把 **Codex CLI 当作 MCP 服务端**挂进 DeepSeek Harness，于是 DSH 侧的 agent（包括
 本插件派出去的 worker）会拿到 `mcp__codex__*` 工具，可以把活**交回 Codex**。
@@ -61,8 +65,9 @@ args: ['mcp-server']
 ## 验证
 
 ```sh
-codex --version                 # 需要 CLI 已登录可用
-codex mcp-server --help         # 应打印 "Start Codex as an MCP server (stdio)"
+codex --version                 # 需要 CLI 已登录可用，且版本仍带 mcp-server（≤ 0.1xx）
+codex mcp-server --help         # 旧版应打印 "Start Codex as an MCP server (stdio)"
+                                # 0.167+ 会报 unrecognized subcommand —— 此时请改用官方 subagent_codex
 ```
 
 接好后在 DSH 侧让 agent 调一次 `mcp__codex__*`；工具没出现就去看 harness 日志

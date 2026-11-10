@@ -2,13 +2,15 @@
 
 `@whaletalk/dsh-codex-collab` 负责 **Codex → DSH** 的派活、已有会话接入、结果关联与授权审批。另行启用官方 `@deepseek-ai/dsh-subagent-codex` 后，DSH 可用 **`subagent_codex`** 调用一个独立的 Codex 执行器。两者可共存，官方运行时不加入本包的默认依赖。
 
+> **Codex CLI 0.167 起**：官方 CLI 移除了 `codex mcp-server`，本包 0.1.12 起也不再内置旧 MCP 反向通道。**DSH → Codex 请优先用本页的官方子代理**；Codex 侧安装命令改为 `codex plugin marketplace add` / `codex plugin add` / `codex mcp add`（见根 README「安装」），并把 DSH 桌面端端口固定为 3080（根 README 同节）。
+
 ## 安装两端
 
-1. 按根 README 安装我们的 DSH 网关及 Codex 侧 MCP/CLI，并在 Codex 中安装启用 `dsh` 协作插件。
-2. 在 DSH 的 desktop/web profile 单独安装并选中官方 Codex 子代理 bundle。选择与宿主配套的版本；不要把 npm 的 `latest` 标签当作宿主兼容性判断。例如 DSH `0.2.1-rc.2`：
+1. 按根 README 安装我们的 DSH 网关及 Codex 侧插件/MCP/CLI（Codex CLI 0.167 用 `codex plugin ...` + `codex mcp add`），并在 Codex 中安装启用 `dsh` 协作插件。
+2. 在 DSH 的 desktop/web profile 单独安装并选中官方 Codex 子代理 bundle。选择与宿主配套的版本；不要把 npm 的 `latest` 标签当作宿主兼容性判断。例如 DSH `0.2.2-rc.1`：
 
    ```sh
-   dsh plugin --profile desktop add @deepseek-ai/dsh-subagent-codex@0.2.1-rc.2
+   dsh plugin --profile desktop add @deepseek-ai/dsh-subagent-codex@0.2.2-rc.1
    ```
 
 3. 检查 DSH 中出现工具 `subagent_codex`。如果安装器提示需要重启，先结束当前任务再重启该 profile。本机上述版本的验证中，bundle 与配置均热加载成功，不需要重启。
@@ -27,7 +29,7 @@ Codex 侧没有另一个必须配套安装的 `dsh-subagent-codex` 插件。现�
 
 本机集成验证发现：官方 `0.2.1-rc.2` 携带的 Codex `0.153.4` 对默认 `gpt-6.1-sol` 返回了“不支持 ChatGPT 账号”的 400；从其模型目录选择 `gpt-6-astra` 后，独立临时 profile 的真实口令任务以 `completed` 结束。其他安装应依据自己的运行时和账号验证，示例中的模型不是所有账号的强制默认值。
 
-旧 `codex-mcp` 通道可继续用于持续对话。如果只需要官方一次性子任务，可在 profile 中显式将 `codex-mcp` 设为 `disabled: true`。这只关闭旧反向通道，不关闭 `dsh-bridge`。
+旧 `codex-mcp` 反向通道已随 Codex CLI 0.167 移除 `codex mcp-server` 而停用；本包 0.1.12 起不再内置该通道。仍在使用旧版 Codex（约 ≤ 0.1xx）的用户可按 [templates/codex-mcp/](../templates/codex-mcp/README.md) 自行启用；新版 DSH→Codex 请直接用本页的 `subagent_codex`。
 
 ## 任务边界
 

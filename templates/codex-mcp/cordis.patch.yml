@@ -1,4 +1,9 @@
-# 反向通道：把 Codex 挂成 DSH 的一个 MCP 服务端。
+# 旧版 Codex 的反向通道（可选）：把 Codex 挂成 DSH 的一个 MCP 服务端。
+#
+# ⚠️ 前提：Codex CLI 仍带 `codex mcp-server`。Codex CLI 0.167.0 已移除该命令，
+#    新版请改用 DSH 官方 @deepseek-ai/dsh-subagent-codex（工具 subagent_codex），
+#    见 docs/OFFICIAL_CODEX_SUBAGENT.md。本文件只保留给旧版 Codex（约 0.1xx 及更早）。
+#    主包 @whaletalk/dsh-codex-collab 自 0.1.12 起不再内置这一行。
 #
 # 谁提供什么：
 #   - DSH 侧：@deepseek-ai/dsh-mcp-client（harness 自带）——连外部 MCP 服务器，
@@ -10,8 +15,7 @@
 #   B) 把本目录当作一个 bundle 安装（路径写绝对路径）：
 #        dsh plugin --profile <profile> add <本目录绝对路径>
 #
-# 注意：主包 @whaletalk/dsh-codex-collab 已内置等价的一行；本文件是**独立版本**，
-# 用于只想单独挂反向通道、或想单独调参的场景。
+# 注意：本文件是**独立版本**，用于只想单独挂反向通道、或想单独调参的场景。
 #
 # 装完必须**重启 profile 进程**：新增组合包不会热挂载，只有重启后工具才会出现。
 # 之后在 DSH 侧的工具列表里找 mcp__codex__*（例如 mcp__codex__codex）。

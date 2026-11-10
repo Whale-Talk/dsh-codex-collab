@@ -24,7 +24,7 @@ let hasAsar = false
 try { fs.accessSync(ASAR); hasAsar = true } catch (e) { hasAsar = false }
 const SKIP = hasAsar ? false : 'app.asar 不在本机（DSH_ASAR=' + ASAR + '）——没有真实 SDK 就诚实跳过，绝不以 mock 冒充 native 证据'
 
-const roots = ['@deepseek-ai/dsh-agent-loop', '@deepseek-ai/cordis', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-scope', '@deepseek-ai/dsh-llm', '@deepseek-ai/schemastery']
+const roots = ['@deepseek-ai/dsh-agent-loop', '@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-session-projection', '@deepseek-ai/cordis', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-scope', '@deepseek-ai/dsh-llm', '@deepseek-ai/schemastery']
 let outDir = null
 let loaded = null
 
@@ -104,7 +104,10 @@ async function loadNative() {
     const nm = path.join(outDir, 'node_modules')
     const loopPath = path.join(nm, '@deepseek-ai/dsh-agent-loop/lib/index.js')
     const loopMod = await import(pathToFileURL(loopPath).href)
-    loaded = { loopMod, loopText: fs.readFileSync(loopPath, 'utf8'), packages: seen.size }
+    const cordis = await import(pathToFileURL(path.join(nm, '@deepseek-ai/cordis/lib/index.js')).href)
+    const agentMod = await import(pathToFileURL(path.join(nm, '@deepseek-ai/dsh-agent/lib/index.js')).href)
+    const projectionMod = await import(pathToFileURL(path.join(nm, '@deepseek-ai/dsh-session-projection/lib/index.js')).href)
+    loaded = { loopMod, loopText: fs.readFileSync(loopPath, 'utf8'), cordis, agentMod, projectionMod, packages: seen.size }
     return loaded
   } catch (e) {
     loaded = null
@@ -123,31 +126,58 @@ after(() => {
   }
 })
 
-test('native: 真实 turnBoundaryProjectionDefinition——回合/步进边界物化（队列消费时机依赖它）', { skip: SKIP }, async () => {
-  const { loopMod } = await loadNative()
-  const definition = loopMod.turnBoundaryProjectionDefinition
-  assert.notEqual(definition, undefined, 'dsh-agent-loop 必须导出 turnBoundaryProjectionDefinition')
-  assert.equal(definition.key, 'turnBoundary')
-  let state = definition.init()
-  assert.deepEqual(state, { openTurnStartSeq: null, lastStepStartSeq: null, lastStepBoundary: null, lastTurn: 0 })
+/**
+ * DSH 0.2.2 起，turn/step 边界是 `ctx.agents.turnBoundaryOf(session)` 背后的真实 projection
+ * （`dsh-agent` 内部 `turnBoundaryProjectionDefinition`，不再从 dsh-agent-loop 导出）。
+ * 这里用**真实** SessionProjectionRegistry + AgentRegistry 物化，断言同一组边界语义。
+ */
+const makeProjectionSession = () => {
+  const events = []
+  return {
+    header: { id: 'native-delivery-probe' },
+    inheritedEventCount: 0,
+    get seq() { return events.length },
+    eventAt(seq) { return events[Number(seq)] },
+    snapshotEvents(from, to) {
+      const start = from === undefined ? 0 : Number(from)
+      const end = to === undefined ? events.length : Number(to)
+      return events.slice(start, end)
+    },
+    append(type, data = {}) { events.push({ seq: events.length, type, data }); return events.length },
+    events,
+  }
+}
 
-  const ev = (seq, type, data = {}) => ({ seq, type, data })
-  state = definition.apply(state, ev(10, 'turn/start', { turn: 7 }))
-  assert.equal(state.lastTurn, 7, 'turn/start 记录 lastTurn')
-  assert.equal(state.openTurnStartSeq, 10, 'turn/start 打开回合（这是"父回合是否开放"的官方判据）')
-  state = definition.apply(state, ev(11, 'step/start', {}))
-  assert.deepEqual(state.lastStepBoundary, { kind: 'start', seq: 11 })
-  state = definition.apply(state, ev(12, 'step/end', {}))
-  assert.deepEqual(state.lastStepBoundary, { kind: 'end', seq: 12 }, 'step/end 记录步进边界（steer 在此边界被消费）')
-  state = definition.apply(state, ev(13, 'turn/end', {}))
-  assert.equal(state.openTurnStartSeq, null, 'turn/end 关闭回合（此后 steer 不再属于该父回合）')
+test('native: 真实 turnBoundary 投影——回合/步进边界物化（队列消费时机依赖它）', { skip: SKIP }, async () => {
+  const { cordis, agentMod, projectionMod } = await loadNative()
+  const ctx = new cordis.Context()
+  const projections = new projectionMod.SessionProjectionRegistry(ctx)
+  assert.equal(typeof projections.register, 'function', '0.2.2 的真实投影注册服务必须可用')
+  const agents = new agentMod.AgentRegistry(ctx)
+  await agents[cordis.Service.init]()
+  const session = makeProjectionSession()
+  const boundary = () => agents.turnBoundaryOf(session)
+
+  assert.deepEqual(boundary(), { openTurnStartSeq: null, lastStepStartSeq: null, lastStepBoundary: null, lastTurn: 0 })
+
+  session.append('turn/start', { turn: 7 })
+  assert.equal(boundary().lastTurn, 7, 'turn/start 记录 lastTurn')
+  assert.equal(boundary().openTurnStartSeq, 0, 'turn/start 打开回合（"父回合是否开放"的官方判据）')
+  session.append('step/start', { turn: 7, step: 1 })
+  assert.equal(boundary().lastStepStartSeq, 1, 'step/start 记录步进起点（0.2.2 新增字段）')
+  assert.deepEqual(boundary().lastStepBoundary, { kind: 'start', seq: 1 })
+  session.append('step/end', { turn: 7, step: 1 })
+  assert.deepEqual(boundary().lastStepBoundary, { kind: 'end', seq: 2 }, 'step/end 记录步进边界（steer 在此边界被消费）')
+  session.append('turn/end', { turn: 7 })
+  assert.equal(boundary().openTurnStartSeq, null, 'turn/end 关闭回合（此后 steer 不再属于该父回合）')
   // 与队列无关的事件不得改变状态（幂等）
-  const before = { ...state }
-  assert.deepEqual(definition.apply(state, ev(14, 'assistant/message', {})), before)
+  const before = boundary()
+  session.append('assistant/message', { turn: 7, step: 1, message: {} })
+  assert.deepEqual(boundary(), before)
   // 事件顺序：turn/start → turn/end → 再 turn/start 必须得到新的开放回合
-  state = definition.apply(state, ev(15, 'turn/start', { turn: 8 }))
-  assert.equal(state.lastTurn, 8)
-  assert.equal(state.openTurnStartSeq, 15)
+  session.append('turn/start', { turn: 8 })
+  assert.equal(boundary().lastTurn, 8)
+  assert.equal(boundary().openTurnStartSeq, session.events.length - 1)
 })
 
 test('native: 真实源码契约——steer/followup/claim/send/dedupe/admission 的准确语义', { skip: SKIP }, async () => {
